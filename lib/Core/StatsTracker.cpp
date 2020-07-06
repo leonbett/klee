@@ -177,7 +177,7 @@ StatsTracker::StatsTracker(Executor &_executor, std::string _objectFilename,
         "--istats-write-after-instructions cannot be enabled at the same "
         "time.");
 
-  KModule *km = executor.kmodule.get();
+  KModule *km = executor.kmodule;
   if(CommitEvery > 0) {
       statsCommitEvery = CommitEvery;
   } else {
@@ -767,7 +767,7 @@ uint64_t klee::computeMinDistToUncovered(const KInstruction *ki,
 }
 
 void StatsTracker::computeReachableUncovered() {
-  KModule *km = executor.kmodule.get();
+  KModule *km = executor.kmodule;
   const auto m = km->module.get();
   static bool init = true;
   const InstructionInfoTable &infos = *km->infos;

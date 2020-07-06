@@ -114,7 +114,7 @@ public:
 private:
   static const char *TerminateReasonNames[];
 
-  std::unique_ptr<KModule> kmodule;
+  KModule* kmodule;
   InterpreterHandler *interpreterHandler;
   Searcher *searcher;
 
@@ -211,9 +211,16 @@ private:
   /// Optimizes expressions
   ExprOptimizer optimizer;
 
+  // Priority lists for concolic solving
+  std::vector<ExecutionState*> prio0, prio1, prio2;
+
+
   /// Points to the merging searcher of the searcher chain,
   /// `nullptr` if merging is disabled
   MergingSearcher *mergingSearcher = nullptr;
+
+  // For prioritized concolic execution
+  void add_forked_state_to_concolic_priority_list(ExecutionState* otherState);
 
   llvm::Function* getTargetFunction(llvm::Value *calledVal,
                                     ExecutionState &state);
@@ -446,8 +453,13 @@ private:
   void dumpPTree();
 
 public:
-  Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,
-      InterpreterHandler *ie);
+  Executor(llvm::LLVMContext &ctx,
+       const InterpreterOptions &opts,
+        InterpreterHandler *ih,
+        TimingSolver* s,
+        KModule* _kmodule,
+        SpecialFunctionHandler *_specialFunctionHandler,
+        StatsTracker *_statsTracker);
   virtual ~Executor();
 
   const InterpreterHandler& getHandler() {
@@ -471,9 +483,6 @@ public:
     replayPath = path;
     replayPosition = 0;
   }
-
-  llvm::Module *setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
-                          const ModuleOptions &opts) override;
 
   void useSeeds(const std::vector<struct KTest *> *seeds) override {
     usingSeeds = seeds;

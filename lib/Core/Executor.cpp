@@ -152,11 +152,11 @@ cl::opt<bool>
                                 "from other constraints (default=false)"),
                        cl::cat(SolvingCat));
 
-cl::opt<bool>
-    EqualitySubstitution("equality-substitution", cl::init(true),
-                         cl::desc("Simplify equality expressions before "
-                                  "querying the solver (default=true)"),
-                         cl::cat(SolvingCat));
+//cl::opt<bool>
+//    EqualitySubstitution("equality-substitution", cl::init(true),
+//                         cl::desc("Simplify equality expressions before "
+//                                  "querying the solver (default=true)"),
+//                         cl::cat(SolvingCat));
 
 
 /*** External call policy options ***/
@@ -409,7 +409,7 @@ cl::opt<bool> DebugCheckForImpliedValues(
 } // namespace
 
 // testing
-bool CONCOLIC = false;
+bool CONCOLIC = true; // false;
 
 namespace klee {
   RNG theRNG;
@@ -436,16 +436,27 @@ const char *Executor::TerminateReasonNames[] = {
   [ Unhandled ] = "xxx",
 };
 
-
-Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
-                   InterpreterHandler *ih)
+static int tries = 0;
+bool enteredDevMain = false;
+Executor::Executor(LLVMContext &ctx,
+	           const InterpreterOptions &opts,
+                   InterpreterHandler *ih,
+		   						 TimingSolver* s,
+									 KModule* _kmodule,
+									 SpecialFunctionHandler *_specialFunctionHandler,
+									 StatsTracker *_statsTracker)
     : Interpreter(opts), interpreterHandler(ih), searcher(0),
-      externalDispatcher(new ExternalDispatcher(ctx)), statsTracker(0),
-      pathWriter(0), symPathWriter(0), specialFunctionHandler(0), timers{time::Span(TimerInterval)},
+      externalDispatcher(new ExternalDispatcher(ctx)), /*statsTracker(0),*/
+      pathWriter(0), symPathWriter(0), /*specialFunctionHandler(0),*/ timers{time::Span(TimerInterval)},
       replayKTest(0), replayPath(0), usingSeeds(0),
       atMemoryLimit(false), inhibitForking(false), haltExecution(false),
       ivcEnabled(false), debugLogBuffer(debugBufferString) {
 
+	enteredDevMain = false; // Must be reset; previous Executor instance will have set it to true, leading to problems with undefined memory in uclibc before user main is reached.
+  kmodule = _kmodule;
+	specialFunctionHandler = _specialFunctionHandler;
+	statsTracker = _statsTracker;
+	specialFunctionHandler->registerExecutor(this); // !
 
   const time::Span maxTime{MaxTime};
   if (maxTime) timers.add(
@@ -456,19 +467,8 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
 
   coreSolverTimeout = time::Span{MaxCoreSolverTime};
   if (coreSolverTimeout) UseForkedCoreSolver = true;
-  Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);
-  if (!coreSolver) {
-    klee_error("Failed to create core solver\n");
-  }
 
-  Solver *solver = constructSolverChain(
-      coreSolver,
-      interpreterHandler->getOutputFilename(ALL_QUERIES_SMT2_FILE_NAME),
-      interpreterHandler->getOutputFilename(SOLVER_QUERIES_SMT2_FILE_NAME),
-      interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
-      interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
-
-  this->solver = new TimingSolver(solver, EqualitySubstitution);
+  this->solver = s; // re-use solve
   memory = new MemoryManager(&arrayCache);
 
   initializeSearchOptions();
@@ -499,79 +499,15 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
   }
 }
 
-llvm::Module *
-Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
-                    const ModuleOptions &opts) {
-  assert(!kmodule && !modules.empty() &&
-         "can only register one module"); // XXX gross
-
-  kmodule = std::unique_ptr<KModule>(new KModule());
-
-  // Preparing the final module happens in multiple stages
-
-  // Link with KLEE intrinsics library before running any optimizations
-  SmallString<128> LibPath(opts.LibraryDir);
-  llvm::sys::path::append(LibPath, "libkleeRuntimeIntrinsic.bca");
-  std::string error;
-  if (!klee::loadFile(LibPath.str(), modules[0]->getContext(), modules,
-                      error)) {
-    klee_error("Could not load KLEE intrinsic file %s", LibPath.c_str());
-  }
-
-  // 1.) Link the modules together
-  while (kmodule->link(modules, opts.EntryPoint)) {
-    // 2.) Apply different instrumentation
-    kmodule->instrument(opts);
-  }
-
-  // 3.) Optimise and prepare for KLEE
-
-  // Create a list of functions that should be preserved if used
-  std::vector<const char *> preservedFunctions;
-  specialFunctionHandler = new SpecialFunctionHandler(*this);
-  specialFunctionHandler->prepare(preservedFunctions);
-
-  preservedFunctions.push_back(opts.EntryPoint.c_str());
-
-  // Preserve the free-standing library calls
-  preservedFunctions.push_back("memset");
-  preservedFunctions.push_back("memcpy");
-  preservedFunctions.push_back("memcmp");
-  preservedFunctions.push_back("memmove");
-
-  kmodule->optimiseAndPrepare(opts, preservedFunctions);
-  kmodule->checkModule();
-
-  // 4.) Manifest the module
-  kmodule->manifest(interpreterHandler, StatsTracker::useStatistics());
-
-  specialFunctionHandler->bind();
-
-  if (StatsTracker::useStatistics() || userSearcherRequiresMD2U()) {
-    statsTracker = 
-      new StatsTracker(*this,
-                       interpreterHandler->getOutputFilename("assembly.ll"),
-                       userSearcherRequiresMD2U());
-  }
-
-  // Initialize the context.
-  DataLayout *TD = kmodule->targetData.get();
-  Context::initialize(TD->isLittleEndian(),
-                      (Expr::Width)TD->getPointerSizeInBits());
-
-  return kmodule->module.get();
-}
-
 Executor::~Executor() {
   delete memory;
   delete externalDispatcher;
-  delete specialFunctionHandler;
-  delete statsTracker;
-  delete solver;
+  //delete specialFunctionHandler;
+  //delete statsTracker;
+  //delete solver;
 }
 
 /***/
-bool enteredDevMain = false;
 void Executor::initializeGlobalObject(ExecutionState &state, ObjectState *os,
                                       const Constant *c, 
                                       unsigned offset, const bool print) {
@@ -925,11 +861,12 @@ void Executor::branch(ExecutionState &state,
           // TODO: see if we can optimize this. We may potentiall get a 2x speedup
           // for replay
           if (CONCOLIC) {
-            errs() << "writing test case for condition:" << conditions[i] << "\n";
-            addConstraint(*result[i], conditions[i]);
-            interpreterHandler->processTestCase(*result[i], 0, 0);
+            ExecutionState* otherState = new ExecutionState(*result[i]);
+            addConstraint(*otherState, conditions[i]);
+            add_forked_state_to_concolic_priority_list(otherState);
           }
 
+          // The state will be terminated and the solver won't consider it further; we have saved a copy in otherState that is used for prioritized solving later on, though.
           terminateState(*result[i]);
           result[i] = NULL;
         }
@@ -940,6 +877,51 @@ void Executor::branch(ExecutionState &state,
   for (unsigned i=0; i<N; ++i)
     if (result[i])
       addConstraint(*result[i], conditions[i]);
+}
+
+std::tuple<bool, uint64_t> getUINTOperandFromMDFirstAnnotInBB(Instruction* anyInstr, StringRef kind, bool bAssert) {
+        for (Instruction& instr : anyInstr->getParent()->getInstList()) {
+                MDNode* md = instr.getMetadata(kind);
+                if (md) return std::make_tuple(true, mdconst::dyn_extract<ConstantInt>(md->getOperand(0))->getZExtValue());
+        }
+        errs() << "getUINTOperandFromMDFirstAnnotInBB: --no instrumentation--\n";
+        return std::make_tuple(false,0);
+}
+
+void Executor::add_forked_state_to_concolic_priority_list(ExecutionState* otherState){
+	Instruction* lastInstr = otherState->prevPC->inst;
+	Instruction* curInstr = otherState->pc->inst;
+	assert((lastInstr->getOpcode() == Instruction::Br || lastInstr->getOpcode() == Instruction::Switch)  && "should always be br/switch/?"); // todo check if conditional br
+	if (lastInstr->getOpcode() == Instruction::Br || lastInstr->getOpcode() == Instruction::Switch) {
+		uint64_t bbid_src, bbid_dest;
+		bool bSrcAnnot, bDestAnnot;
+		std::tie(bSrcAnnot, bbid_src) = getUINTOperandFromMDFirstAnnotInBB(lastInstr, "bbid", true);
+		std::tie(bDestAnnot, bbid_dest) = getUINTOperandFromMDFirstAnnotInBB(curInstr, "bbid", true);
+		// TODO: Prune edges that were covered already
+		// Method: Read a list of edges, if (bbid_src, bbid_dest) in edges:  assign priority 0.
+
+		bool bPrioritized = false;
+		if (bSrcAnnot && bDestAnnot) { // uclibc is not instrumented for now
+			// Branches annotated with 'san_edge' lead directly to a sanitizer exception and thus are assigned the highest priority 2.
+			if (lastInstr->getMetadata("san_edge")) {
+				prio2.push_back(otherState);
+				bPrioritized = true;
+			}
+			else {
+				// The first instr of every bb is annotated with 'reachable_san', which has a parameter expressing the # of reachable sanitizer instrumentation sites. These branches have priority 1.
+				bool bBugAnnot;
+				uint64_t nSan;
+				std::tie(bBugAnnot, nSan) = getUINTOperandFromMDFirstAnnotInBB(lastInstr, "reachable_san", true);
+				if (bBugAnnot && nSan > 0) { 
+								prio1.push_back(otherState);
+								bPrioritized = true;
+				}
+			}
+		}
+		if (!bPrioritized) {
+			prio0.push_back(otherState);
+		}
+	}
 }
 
 Executor::StatePair 
@@ -1061,17 +1043,12 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
     }
     if (!(trueSeed && falseSeed)) {
       assert(trueSeed || falseSeed);
-      
+
       /* test concolic: called for if-statements */
       if (CONCOLIC) {
-        /* Note: we write the .ktest immediately. This has the benefit of free()'ing memory */
-        ExecutionState otherState(current);
-        //assert(otherState && "new ExecutionState(current) failed");
-        addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
-        // TODO: get value/process file and drop it
-        interpreterHandler->processTestCase(otherState, 0, 0); // TODO: maybe create our own terminate function
-        //terminateState(*otherState);
-        interpreterHandler->incPathsExplored(); // not sure this is correct
+        ExecutionState* otherState = new ExecutionState(current);
+        addConstraint(*otherState, trueSeed ? Expr::createIsZero(condition) : condition); // flip condition
+        add_forked_state_to_concolic_priority_list(otherState);
       }
 
       res = trueSeed ? Solver::True : Solver::False;
@@ -2935,7 +2912,9 @@ void Executor::doDumpStates() {
 }
 
 void Executor::run(ExecutionState &initialState) {
-  bindModuleConstants();
+  if (tries==0)
+		bindModuleConstants(); // Only do this once, because we can reuse it.
+
 //errs() << "bindModules\n";
   // Delay init till now so that ticks don't accrue during optimization and such.
   timers.reset();
@@ -2998,12 +2977,33 @@ void Executor::run(ExecutionState &initialState) {
     }
 
     klee_message("seeding done (%d states remain)", (int) states.size());
+    klee_message("<CONC> sizeof prio2: %lu", prio2.size());
+    klee_message("<CONC> sizeof prio1: %lu", prio1.size());
+    klee_message("<CONC> sizeof prio0: %lu", prio0.size());
+    for ( auto &s : prio2 ) {
+        //klee_message("Solving prio2");
+        interpreterHandler->processTestCase(*s, 0, 0); // TODO: maybe create our own terminate function
+        interpreterHandler->incPathsExplored(); // not sure this is correct
+    }
+    for ( auto &s : prio1 ) {
+        interpreterHandler->processTestCase(*s, 0, 0); // TODO: maybe create our own terminate function
+        interpreterHandler->incPathsExplored(); // not sure this is correct
+    }
+    /*for ( auto &s : prio0 ) {
+        klee_message("Solving prio0");
+        interpreterHandler->processTestCase(*s, 0, 0); // TODO: maybe create our own terminate function
+        interpreterHandler->incPathsExplored(); // not sure this is correct
+    }*/
+
+    klee_message("states size() after: %lu\n", states.size());
 
     if (OnlySeed) {
       doDumpStates();
       return;
     }
   }
+	
+	assert(false && "Shouldn't reach this for the experiment\n");
 
   searcher = constructUserSearcher(*this);
 
@@ -4136,13 +4136,15 @@ void Executor::runFunctionAsMain(Function *f,
 
   // hack to clear memory objects
   delete memory;
-  memory = new MemoryManager(NULL);
+  //memory = new MemoryManager(NULL);
 
   globalObjects.clear();
   globalAddresses.clear();
 
   if (statsTracker)
     statsTracker->done();
+
+	tries++;
 }
 
 unsigned Executor::getPathStreamID(const ExecutionState &state) {
@@ -4434,6 +4436,9 @@ void Executor::dumpStates() {
 ///
 
 Interpreter *Interpreter::create(LLVMContext &ctx, const InterpreterOptions &opts,
-                                 InterpreterHandler *ih) {
-  return new Executor(ctx, opts, ih);
+                                 InterpreterHandler *ih, TimingSolver* s,
+                                   KModule* _kmodule,
+                                   SpecialFunctionHandler *_specialFunctionHandler,
+                                   StatsTracker *_statsTracker){
+  return new Executor(ctx, opts, ih, s, _kmodule, _specialFunctionHandler, _statsTracker);
 }
