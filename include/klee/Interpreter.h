@@ -100,12 +100,12 @@ public:
   virtual ~Interpreter() {}
 
   static Interpreter *create(llvm::LLVMContext &ctx,
-                             const InterpreterOptions &_interpreterOpts,
+                             const InterpreterOptions &interpreterOpts,
                              InterpreterHandler *ih,
                              TimingSolver* s,
-                             klee::KModule* _kmodule,
-                             SpecialFunctionHandler *_specialFunctionHandler,
-                             StatsTracker *_statsTracker);
+                             klee::KModule* kmodule,
+                             SpecialFunctionHandler *specialFunctionHandler,
+                             StatsTracker *statsTracker);
 
   /// Register the module to be executed.
   /// \param modules A list of modules that should form the final

@@ -117,14 +117,13 @@ private:
   KModule* kmodule;
   InterpreterHandler *interpreterHandler;
   Searcher *searcher;
-
   ExternalDispatcher *externalDispatcher;
   TimingSolver *solver;
   MemoryManager *memory;
   std::set<ExecutionState*> states;
   StatsTracker *statsTracker;
-  TreeStreamWriter *pathWriter, *symPathWriter;
   SpecialFunctionHandler *specialFunctionHandler;
+  TreeStreamWriter *pathWriter, *symPathWriter;
   TimerGroup timers;
   std::unique_ptr<PTree> processTree;
 
@@ -220,7 +219,7 @@ private:
   MergingSearcher *mergingSearcher = nullptr;
 
   // For prioritized concolic execution
-  void add_forked_state_to_concolic_priority_list(ExecutionState* otherState);
+  void addForkedStateToConcolicPriorityList(ExecutionState* otherState);
 
   llvm::Function* getTargetFunction(llvm::Value *calledVal,
                                     ExecutionState &state);
@@ -457,9 +456,9 @@ public:
        const InterpreterOptions &opts,
         InterpreterHandler *ih,
         TimingSolver* s,
-        KModule* _kmodule,
-        SpecialFunctionHandler *_specialFunctionHandler,
-        StatsTracker *_statsTracker);
+        KModule* kmodule,
+        SpecialFunctionHandler *specialFunctionHandler,
+        StatsTracker *statsTracker);
   virtual ~Executor();
 
   const InterpreterHandler& getHandler() {

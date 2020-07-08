@@ -441,22 +441,32 @@ bool enteredDevMain = false;
 Executor::Executor(LLVMContext &ctx,
 	           const InterpreterOptions &opts,
                    InterpreterHandler *ih,
-		   						 TimingSolver* s,
-									 KModule* _kmodule,
-									 SpecialFunctionHandler *_specialFunctionHandler,
-									 StatsTracker *_statsTracker)
-    : Interpreter(opts), interpreterHandler(ih), searcher(0),
-      externalDispatcher(new ExternalDispatcher(ctx)), /*statsTracker(0),*/
-      pathWriter(0), symPathWriter(0), /*specialFunctionHandler(0),*/ timers{time::Span(TimerInterval)},
-      replayKTest(0), replayPath(0), usingSeeds(0),
-      atMemoryLimit(false), inhibitForking(false), haltExecution(false),
-      ivcEnabled(false), debugLogBuffer(debugBufferString) {
-
-	enteredDevMain = false; // Must be reset; previous Executor instance will have set it to true, leading to problems with undefined memory in uclibc before user main is reached.
-  kmodule = _kmodule;
-	specialFunctionHandler = _specialFunctionHandler;
-	statsTracker = _statsTracker;
-	specialFunctionHandler->registerExecutor(this); // !
+		   TimingSolver* s,
+		   KModule* kmodule,
+		   SpecialFunctionHandler *specialFunctionHandler,
+		   StatsTracker *statsTracker)
+    : Interpreter(opts),
+      kmodule(kmodule),
+      interpreterHandler(ih),
+      searcher(0),
+      externalDispatcher(new ExternalDispatcher(ctx)),
+      solver(s),
+      statsTracker(statsTracker), /*statsTracker(0),*/
+      specialFunctionHandler(specialFunctionHandler), /*specialFunctionHandler(0),*/
+      pathWriter(0),
+      symPathWriter(0),
+      timers{time::Span(TimerInterval)},
+      replayKTest(0),
+      replayPath(0),
+      usingSeeds(0),
+      atMemoryLimit(false),
+      inhibitForking(false),
+      haltExecution(false),
+      ivcEnabled(false),
+      debugLogBuffer(debugBufferString)
+  {
+  enteredDevMain = false; // Must be reset; previous Executor instance will have set it to true, leading to problems with undefined memory in uclibc before user main is reached.
+  specialFunctionHandler->registerExecutor(this); // !
 
   const time::Span maxTime{MaxTime};
   if (maxTime) timers.add(
@@ -468,7 +478,7 @@ Executor::Executor(LLVMContext &ctx,
   coreSolverTimeout = time::Span{MaxCoreSolverTime};
   if (coreSolverTimeout) UseForkedCoreSolver = true;
 
-  this->solver = s; // re-use solve
+  //this->solver = _s; // re-use solve
   memory = new MemoryManager(&arrayCache);
 
   initializeSearchOptions();
@@ -863,7 +873,7 @@ void Executor::branch(ExecutionState &state,
           if (CONCOLIC) {
             ExecutionState* otherState = new ExecutionState(*result[i]);
             addConstraint(*otherState, conditions[i]);
-            add_forked_state_to_concolic_priority_list(otherState);
+            addForkedStateToConcolicPriorityList(otherState);
           }
 
           // The state will be terminated and the solver won't consider it further; we have saved a copy in otherState that is used for prioritized solving later on, though.
@@ -888,7 +898,7 @@ std::tuple<bool, uint64_t> getUINTOperandFromMDFirstAnnotInBB(Instruction* anyIn
         return std::make_tuple(false,0);
 }
 
-void Executor::add_forked_state_to_concolic_priority_list(ExecutionState* otherState){
+void Executor::addForkedStateToConcolicPriorityList(ExecutionState* otherState){
 	Instruction* lastInstr = otherState->prevPC->inst;
 	Instruction* curInstr = otherState->pc->inst;
 	assert((lastInstr->getOpcode() == Instruction::Br || lastInstr->getOpcode() == Instruction::Switch)  && "should always be br/switch/?"); // todo check if conditional br
@@ -1048,7 +1058,7 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
       if (CONCOLIC) {
         ExecutionState* otherState = new ExecutionState(current);
         addConstraint(*otherState, trueSeed ? Expr::createIsZero(condition) : condition); // flip condition
-        add_forked_state_to_concolic_priority_list(otherState);
+        addForkedStateToConcolicPriorityList(otherState);
       }
 
       res = trueSeed ? Solver::True : Solver::False;
@@ -4435,10 +4445,12 @@ void Executor::dumpStates() {
 
 ///
 
-Interpreter *Interpreter::create(LLVMContext &ctx, const InterpreterOptions &opts,
-                                 InterpreterHandler *ih, TimingSolver* s,
-                                   KModule* _kmodule,
-                                   SpecialFunctionHandler *_specialFunctionHandler,
-                                   StatsTracker *_statsTracker){
-  return new Executor(ctx, opts, ih, s, _kmodule, _specialFunctionHandler, _statsTracker);
+Interpreter *Interpreter::create(LLVMContext &ctx,
+                                 const InterpreterOptions &opts,
+                                 InterpreterHandler *ih,
+                                 TimingSolver* s,
+                                 KModule* kmodule,
+                                 SpecialFunctionHandler *specialFunctionHandler,
+                                 StatsTracker *statsTracker){
+  return new Executor(ctx, opts, ih, s, kmodule, specialFunctionHandler, statsTracker);
 }
