@@ -33,6 +33,7 @@ class ExecutionState;
 class Interpreter;
 class TreeStreamWriter;
 class KModule;
+class ArrayCache;
 
 class InterpreterHandler {
 public:
@@ -105,7 +106,8 @@ public:
                              TimingSolver* s,
                              klee::KModule* kmodule,
                              SpecialFunctionHandler *specialFunctionHandler,
-                             StatsTracker *statsTracker);
+                             StatsTracker *statsTracker,
+			     ArrayCache* arrayCache);
 
   /// Register the module to be executed.
   /// \param modules A list of modules that should form the final

@@ -26,6 +26,7 @@
 #include "klee/Solver/SolverCmdLine.h"
 #include "klee/Statistics.h"
 #include "klee/Common.h"
+#include "klee/Expr/ArrayCache.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -1554,6 +1555,7 @@ int main(int argc, char **argv, char **envp) {
   }
 
   externalsAndGlobalsCheck(finalModule);
+  ArrayCache* arrayCache = new ArrayCache(); // reused across Executor instances.
 
   /* Leaving Replay out for now */
   /*if (ReplayPathFile != "") {
@@ -1681,7 +1683,7 @@ int main(int argc, char **argv, char **envp) {
    Interpreter::InterpreterOptions IOpts;
    IOpts.MakeConcreteSymbolic = MakeConcreteSymbolic;
    Interpreter *interpreter =
-    theInterpreter = Interpreter::create(ctx, IOpts, handler, timingSolver, kmodule, specialFunctionHandler, statsTracker); // This calls the Executor() constructor
+    theInterpreter = Interpreter::create(ctx, IOpts, handler, timingSolver, kmodule, specialFunctionHandler, statsTracker, arrayCache); // This calls the Executor() constructor
    assert(interpreter);
    handler->setInterpreter(interpreter);
 
@@ -1707,9 +1709,9 @@ int main(int argc, char **argv, char **envp) {
      kTest_free(seeds.back());
      seeds.pop_back();
    }
-   //delete interpreter; // ERROR: some references in cache are invalid after delete.
+   delete interpreter;
   }
-	cleanup_monitor_directory(0, nullptr);
+   cleanup_monitor_directory(0, nullptr);
  }
 
   auto endTime = std::time(nullptr);
@@ -1789,7 +1791,8 @@ int main(int argc, char **argv, char **envp) {
     llvm::errs().resetColor();
 
   handler->getInfoStream() << stats.str();
-
+  
+  delete arrayCache; 
   delete handler;
 
   return 0;

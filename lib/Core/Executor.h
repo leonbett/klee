@@ -122,6 +122,7 @@ private:
   MemoryManager *memory;
   std::set<ExecutionState*> states;
   StatsTracker *statsTracker;
+  ArrayCache* arrayCache;
   SpecialFunctionHandler *specialFunctionHandler;
   TreeStreamWriter *pathWriter, *symPathWriter;
   TimerGroup timers;
@@ -194,9 +195,6 @@ private:
 
   /// Maximum time to allow for a single instruction.
   time::Span maxInstructionTime;
-
-  /// Assumes ownership of the created array objects
-  ArrayCache arrayCache;
 
   /// File to print executed instructions to
   std::unique_ptr<llvm::raw_ostream> debugInstFile;
@@ -458,7 +456,8 @@ public:
         TimingSolver* s,
         KModule* kmodule,
         SpecialFunctionHandler *specialFunctionHandler,
-        StatsTracker *statsTracker);
+        StatsTracker *statsTracker,
+	ArrayCache* arrayCache);
   virtual ~Executor();
 
   const InterpreterHandler& getHandler() {

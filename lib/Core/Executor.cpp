@@ -32,6 +32,7 @@
 #include "klee/Expr/ExprPPrinter.h"
 #include "klee/Expr/ExprSMTLIBPrinter.h"
 #include "klee/Expr/ExprUtil.h"
+#include "klee/Expr/ArrayCache.h"
 #include "klee/Internal/ADT/KTest.h"
 #include "klee/Internal/ADT/RNG.h"
 #include "klee/Internal/Module/Cell.h"
@@ -444,7 +445,8 @@ Executor::Executor(LLVMContext &ctx,
 		   TimingSolver* s,
 		   KModule* kmodule,
 		   SpecialFunctionHandler *specialFunctionHandler,
-		   StatsTracker *statsTracker)
+		   StatsTracker *statsTracker,
+		   ArrayCache* arrayCache)
     : Interpreter(opts),
       kmodule(kmodule),
       interpreterHandler(ih),
@@ -452,6 +454,7 @@ Executor::Executor(LLVMContext &ctx,
       externalDispatcher(new ExternalDispatcher(ctx)),
       solver(s),
       statsTracker(statsTracker), /*statsTracker(0),*/
+      arrayCache(arrayCache),
       specialFunctionHandler(specialFunctionHandler), /*specialFunctionHandler(0),*/
       pathWriter(0),
       symPathWriter(0),
@@ -466,7 +469,7 @@ Executor::Executor(LLVMContext &ctx,
       debugLogBuffer(debugBufferString)
   {
   enteredDevMain = false; // Must be reset; previous Executor instance will have set it to true, leading to problems with undefined memory in uclibc before user main is reached.
-  specialFunctionHandler->registerExecutor(this); // !
+  specialFunctionHandler->registerExecutor(this);
 
   const time::Span maxTime{MaxTime};
   if (maxTime) timers.add(
@@ -478,8 +481,7 @@ Executor::Executor(LLVMContext &ctx,
   coreSolverTimeout = time::Span{MaxCoreSolverTime};
   if (coreSolverTimeout) UseForkedCoreSolver = true;
 
-  //this->solver = _s; // re-use solve
-  memory = new MemoryManager(&arrayCache);
+  memory = new MemoryManager(arrayCache);
 
   initializeSearchOptions();
 
@@ -3402,7 +3404,7 @@ ref<Expr> Executor::replaceReadWithSymbolic(ExecutionState &state,
   
   static unsigned id;
   const Array *array =
-      arrayCache.CreateArray("rrws_arr" + llvm::utostr(++id),
+      arrayCache->CreateArray("rrws_arr" + llvm::utostr(++id),
                              Expr::getMinBytesForWidth(e->getWidth()));
   ref<Expr> res = Expr::createTempRead(array, e->getWidth());
   ref<Expr> eq = NotOptimizedExpr::create(EqExpr::create(e, res));
@@ -3982,7 +3984,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     while (!state.arrayNames.insert(uniqueName).second) {
       uniqueName = name + "_" + llvm::utostr(++id);
     }
-    const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
+    const Array *array = arrayCache->CreateArray(uniqueName, mo->size);
     bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
     
@@ -4146,7 +4148,7 @@ void Executor::runFunctionAsMain(Function *f,
 
   // hack to clear memory objects
   delete memory;
-  //memory = new MemoryManager(NULL);
+  memory = new MemoryManager(NULL);
 
   globalObjects.clear();
   globalAddresses.clear();
@@ -4154,7 +4156,7 @@ void Executor::runFunctionAsMain(Function *f,
   if (statsTracker)
     statsTracker->done();
 
-	tries++;
+  tries++;
 }
 
 unsigned Executor::getPathStreamID(const ExecutionState &state) {
@@ -4451,6 +4453,7 @@ Interpreter *Interpreter::create(LLVMContext &ctx,
                                  TimingSolver* s,
                                  KModule* kmodule,
                                  SpecialFunctionHandler *specialFunctionHandler,
-                                 StatsTracker *statsTracker){
-  return new Executor(ctx, opts, ih, s, kmodule, specialFunctionHandler, statsTracker);
+                                 StatsTracker *statsTracker,
+                                 ArrayCache* arrayCache){
+  return new Executor(ctx, opts, ih, s, kmodule, specialFunctionHandler, statsTracker, arrayCache);
 }
