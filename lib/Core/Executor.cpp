@@ -873,9 +873,9 @@ void Executor::branch(ExecutionState &state,
           // TODO: see if we can optimize this. We may potentiall get a 2x speedup
           // for replay
           if (CONCOLIC) {
-            ExecutionState* otherState = new ExecutionState(*result[i]);
-            addConstraint(*otherState, conditions[i]);
-            addForkedStateToConcolicPriorityList(otherState);
+            errs() << "writing test case for condition:" << conditions[i] << "\n";
+            addConstraint(*result[i], conditions[i]);
+            interpreterHandler->processTestCase(*result[i], 0, 0);
           }
 
           // The state will be terminated and the solver won't consider it further; we have saved a copy in otherState that is used for prioritized solving later on, though.
@@ -889,51 +889,6 @@ void Executor::branch(ExecutionState &state,
   for (unsigned i=0; i<N; ++i)
     if (result[i])
       addConstraint(*result[i], conditions[i]);
-}
-
-std::tuple<bool, uint64_t> getUINTOperandFromMDFirstAnnotInBB(Instruction* anyInstr, StringRef kind, bool bAssert) {
-        for (Instruction& instr : anyInstr->getParent()->getInstList()) {
-                MDNode* md = instr.getMetadata(kind);
-                if (md) return std::make_tuple(true, mdconst::dyn_extract<ConstantInt>(md->getOperand(0))->getZExtValue());
-        }
-        errs() << "getUINTOperandFromMDFirstAnnotInBB: --no instrumentation--\n";
-        return std::make_tuple(false,0);
-}
-
-void Executor::addForkedStateToConcolicPriorityList(ExecutionState* otherState){
-	Instruction* lastInstr = otherState->prevPC->inst;
-	Instruction* curInstr = otherState->pc->inst;
-	assert((lastInstr->getOpcode() == Instruction::Br || lastInstr->getOpcode() == Instruction::Switch)  && "should always be br/switch/?"); // todo check if conditional br
-	if (lastInstr->getOpcode() == Instruction::Br || lastInstr->getOpcode() == Instruction::Switch) {
-		uint64_t bbid_src, bbid_dest;
-		bool bSrcAnnot, bDestAnnot;
-		std::tie(bSrcAnnot, bbid_src) = getUINTOperandFromMDFirstAnnotInBB(lastInstr, "bbid", true);
-		std::tie(bDestAnnot, bbid_dest) = getUINTOperandFromMDFirstAnnotInBB(curInstr, "bbid", true);
-		// TODO: Prune edges that were covered already
-		// Method: Read a list of edges, if (bbid_src, bbid_dest) in edges:  assign priority 0.
-
-		bool bPrioritized = false;
-		if (bSrcAnnot && bDestAnnot) { // uclibc is not instrumented for now
-			// Branches annotated with 'san_edge' lead directly to a sanitizer exception and thus are assigned the highest priority 2.
-			if (lastInstr->getMetadata("san_edge")) {
-				prio2.push_back(otherState);
-				bPrioritized = true;
-			}
-			else {
-				// The first instr of every bb is annotated with 'reachable_san', which has a parameter expressing the # of reachable sanitizer instrumentation sites. These branches have priority 1.
-				bool bBugAnnot;
-				uint64_t nSan;
-				std::tie(bBugAnnot, nSan) = getUINTOperandFromMDFirstAnnotInBB(lastInstr, "reachable_san", true);
-				if (bBugAnnot && nSan > 0) { 
-								prio1.push_back(otherState);
-								bPrioritized = true;
-				}
-			}
-		}
-		if (!bPrioritized) {
-			prio0.push_back(otherState);
-		}
-	}
 }
 
 Executor::StatePair 
@@ -1058,9 +1013,10 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
 
       /* test concolic: called for if-statements */
       if (CONCOLIC) {
-        ExecutionState* otherState = new ExecutionState(current);
-        addConstraint(*otherState, trueSeed ? Expr::createIsZero(condition) : condition); // flip condition
-        addForkedStateToConcolicPriorityList(otherState);
+        ExecutionState otherState(current);
+        addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
+        interpreterHandler->processTestCase(otherState, 0, 0); // TODO: maybe create our own terminate function
+        interpreterHandler->incPathsExplored(); // not sure this is correct
       }
 
       res = trueSeed ? Solver::True : Solver::False;
@@ -2925,7 +2881,7 @@ void Executor::doDumpStates() {
 
 void Executor::run(ExecutionState &initialState) {
   if (tries==0)
-		bindModuleConstants(); // Only do this once, because we can reuse it.
+    bindModuleConstants(); // Only do this once, because we can reuse it.
 
 //errs() << "bindModules\n";
   // Delay init till now so that ticks don't accrue during optimization and such.
@@ -2989,25 +2945,6 @@ void Executor::run(ExecutionState &initialState) {
     }
 
     klee_message("seeding done (%d states remain)", (int) states.size());
-    klee_message("<CONC> sizeof prio2: %lu", prio2.size());
-    klee_message("<CONC> sizeof prio1: %lu", prio1.size());
-    klee_message("<CONC> sizeof prio0: %lu", prio0.size());
-    for ( auto &s : prio2 ) {
-        //klee_message("Solving prio2");
-        interpreterHandler->processTestCase(*s, 0, 0); // TODO: maybe create our own terminate function
-        interpreterHandler->incPathsExplored(); // not sure this is correct
-    }
-    for ( auto &s : prio1 ) {
-        interpreterHandler->processTestCase(*s, 0, 0); // TODO: maybe create our own terminate function
-        interpreterHandler->incPathsExplored(); // not sure this is correct
-    }
-    /*for ( auto &s : prio0 ) {
-        klee_message("Solving prio0");
-        interpreterHandler->processTestCase(*s, 0, 0); // TODO: maybe create our own terminate function
-        interpreterHandler->incPathsExplored(); // not sure this is correct
-    }*/
-
-    klee_message("states size() after: %lu\n", states.size());
 
     if (OnlySeed) {
       doDumpStates();
@@ -3015,7 +2952,7 @@ void Executor::run(ExecutionState &initialState) {
     }
   }
 	
-	assert(false && "Shouldn't reach this for the experiment\n");
+  assert(false && "Shouldn't reach this for the experiment\n");
 
   searcher = constructUserSearcher(*this);
 
