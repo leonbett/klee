@@ -12,6 +12,8 @@
 
 #include "klee/Config/Version.h"
 #include "klee/Interpreter.h"
+#include "klee/Internal/Module/InstructionInfoTable.h"
+#include "klee/Internal/Module/Cell.h"
 
 #include "llvm/ADT/ArrayRef.h"
 

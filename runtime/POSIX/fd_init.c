@@ -115,6 +115,7 @@ void klee_init_fds(unsigned n_files, unsigned file_length,
   struct stat64 s;
 
   stat64(".", &s);
+  klee_ignore_undefined(&s, sizeof(s));
 
   __exe_fs.n_sym_files = n_files;
   __exe_fs.sym_files = malloc(sizeof(*__exe_fs.sym_files) * n_files);

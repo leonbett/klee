@@ -39,11 +39,11 @@ class MemoryObject {
   friend class ref<const MemoryObject>;
 
 private:
-  static int counter;
   /// @brief Required by klee::ref-managed objects
   mutable class ReferenceCounter _refCount;
 
 public:
+  static int counter;
   unsigned id;
   uint64_t address;
 

@@ -20,10 +20,13 @@
 #include "klee/Internal/Support/ModuleUtil.h"
 #include "klee/Internal/Support/PrintVersion.h"
 #include "klee/Internal/System/Time.h"
+#include "klee/Internal/Module/KModule.h"
 #include "klee/Interpreter.h"
 #include "klee/OptionCategories.h"
 #include "klee/Solver/SolverCmdLine.h"
 #include "klee/Statistics.h"
+#include "klee/Common.h"
+#include "klee/Expr/ArrayCache.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -54,6 +57,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/inotify.h>
 
 #include <cerrno>
 #include <ctime>
@@ -74,6 +78,11 @@ namespace {
   InputArgv(cl::ConsumeAfter,
             cl::desc("<program arguments>..."));
 
+cl::opt<bool>
+    EqualitySubstitution("equality-substitution", cl::init(true),
+                         cl::desc("Simplify equality expressions before "
+                                  "querying the solver (default=true)"),
+                         cl::cat(SolvingCat));
 
   /*** Test case options ***/
 
@@ -126,6 +135,12 @@ namespace {
 
   cl::OptionCategory StartCat("Startup options",
                               "These options affect how execution is started.");
+
+  cl::opt<std::string>
+  RawSyncDir("sync-dir",
+            cl::desc("Directory where KLEE will output generated raw testcases to interface with a fuzzer."),
+            cl::init(""),
+            cl::cat(StartCat));
 
   cl::opt<std::string>
   EntryPoint("entry-point",
@@ -263,6 +278,12 @@ namespace {
   SeedOutDir("seed-dir",
              cl::desc("Directory with .ktest files to be used as seeds"),
              cl::cat(SeedingCat));
+
+  cl::opt<std::string>
+  ServerSeedDir("server-seed-dir",
+             cl::desc("KLEE monitors this directory for newly created .ktest files that will be used as seeds"),
+             cl::cat(SeedingCat));
+
 
   cl::opt<unsigned>
   MakeConcreteSymbolic("make-concrete-symbolic",
@@ -507,6 +528,16 @@ void KleeHandler::processTestCase(const ExecutionState &state,
         klee_warning("unable to write output test case, losing it");
       } else {
         ++m_numGeneratedTests;
+
+        // Output test cases in raw format    
+        if (b.numObjects > 0 && RawSyncDir != "") {
+					SmallString<128> path(RawSyncDir);
+					sys::path::append(path, getTestFilename("raw", id));
+					// Assumption: path exists; must be created by coordinator.
+					FILE *fRaw = fopen(path.c_str(), "wb");
+					KTestObject *o = &b.objects[0];
+					fwrite(o->bytes, o->numBytes, 1, fRaw);
+					fclose(fRaw);
       }
 
       for (unsigned i=0; i<b.numObjects; i++)
@@ -599,8 +630,9 @@ void KleeHandler::processTestCase(const ExecutionState &state,
     klee_error("EXITING ON ERROR:\n%s\n", errorMessage);
   }
 }
+}
 
-  // load a .path file
+// load a .path file
 void KleeHandler::loadPathFile(std::string name,
                                      std::vector<bool> &buffer) {
   std::ifstream f(name.c_str(), std::ios::in | std::ios::binary);
@@ -1133,6 +1165,145 @@ linkWithUclibc(StringRef libDir,
 }
 #endif
 
+
+KModule* kmodule = nullptr;
+SpecialFunctionHandler *specialFunctionHandler;
+StatsTracker *statsTracker;
+// copied from Executor.cpp
+llvm::Module *
+setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
+                    const Interpreter::ModuleOptions &opts,
+                   KleeHandler *interpreterHandler) {
+
+  assert(!kmodule && !modules.empty() &&
+         "can only register one module"); // XXX gross
+
+  kmodule = new KModule(); // std::unique_ptr<KModule>(new KModule());
+
+  // Preparing the final module happens in multiple stages
+
+  // Link with KLEE intrinsics library before running any optimizations
+  SmallString<128> LibPath(opts.LibraryDir);
+  llvm::sys::path::append(LibPath, "libkleeRuntimeIntrinsic.bca");
+  std::string error;
+  if (!klee::loadFile(LibPath.str(), modules[0]->getContext(), modules, error)) {
+    klee_error("Could not load KLEE intrinsic file %s", LibPath.c_str());
+  }
+
+  // 1.) Link the modules together
+  while (kmodule->link(modules, opts.EntryPoint)) {
+    // 2.) Apply different instrumentation
+    kmodule->instrument(opts);
+  }
+
+  // 3.) Optimise and prepare for KLEE
+
+  // Create a list of functions that should be preserved if used
+  std::vector<const char *> preservedFunctions;
+  specialFunctionHandler = new SpecialFunctionHandler(*kmodule); // This now expects a kmodule ref. 
+  specialFunctionHandler->prepare(preservedFunctions);
+
+  preservedFunctions.push_back(opts.EntryPoint.c_str());
+
+  // Preserve the free-standing library calls
+  preservedFunctions.push_back("memset");
+  preservedFunctions.push_back("memcpy");
+  preservedFunctions.push_back("memcmp");
+  preservedFunctions.push_back("memmove");
+
+  kmodule->optimiseAndPrepare(opts, preservedFunctions);
+  kmodule->checkModule();
+
+  // 4.) Manifest the module
+  kmodule->manifest(interpreterHandler, StatsTracker::useStatistics());
+
+  specialFunctionHandler->bind(); // should work
+
+// TODO: Include this again
+/*
+  if (StatsTracker::useStatistics() || userSearcherRequiresMD2U()) {
+    statsTracker = 
+      new StatsTracker(*this,
+                       interpreterHandler->getOutputFilename("assembly.ll"),
+                       userSearcherRequiresMD2U());
+  }
+*/
+  // Initialize the context.
+  DataLayout *TD = kmodule->targetData.get();
+  Context::initialize(TD->isLittleEndian(),
+                      (Expr::Width)TD->getPointerSizeInBits());
+
+  return kmodule->module.get();
+}
+
+//src: https://stackoverflow.com/questions/28455484/linux-c-notify-file-type-creation
+// does this work with clang?
+#ifdef __GNUC__
+#  define ALIGNAS(TYPE) __attribute__ ((aligned(__alignof__(TYPE))))
+#else
+#  define ALIGNAS(TYPE) __attribute__ ((aligned(__alignof__(TYPE))))
+//#  define ALIGNAS(TYPE) /* empty */
+#endif
+
+int notifyfd = -1;
+int watchfd = -1;
+std::string blocking_get_new_seed_file() {
+       char buffer[sizeof(struct inotify_event) + NAME_MAX + 1] ALIGNAS(struct inotify_event);
+       const struct inotify_event * event_ptr;
+       // TODO check that name ends in '.ktest'
+       ssize_t count = read(notifyfd, buffer, sizeof(buffer));
+      if (count < 0) 
+       {
+               errs() << "blocking_get_new_seed() failure..\n";
+               exit(1);
+       }
+       event_ptr = (const struct inotify_event *) buffer;
+       assert(event_ptr->wd == watchfd);
+       assert(event_ptr->mask & IN_CREATE);
+       assert(event_ptr->len);
+       std::string fname(event_ptr->name);
+  
+       SmallString<128> newSeed(ServerSeedDir);
+       llvm::sys::path::append(newSeed, fname);
+       return newSeed.str();
+}
+
+static int cleanup_monitor_directory(int error, const char* msg) {
+ if (error) {
+       errs() << "ERROR: " << msg << "\n";
+ }
+
+ if (watchfd >= 0)
+    {
+      close(watchfd);
+      watchfd = -1;
+   }
+  if (notifyfd >= 0)
+    {
+      close(notifyfd);
+      notifyfd = -1;
+    }
+
+  return error;
+}
+
+static int
+setup_monitor_directory()
+{
+ assert(!ServerSeedDir.empty());
+
+ notifyfd = inotify_init();
+ if (notifyfd < 0)
+ 	return cleanup_monitor_directory(1, "inotify_init");
+
+ watchfd = inotify_add_watch(notifyfd, ServerSeedDir.c_str(), IN_CREATE);
+ if (watchfd < 0)
+ 	return cleanup_monitor_directory(1, "inotify_add_watch");
+
+ return 0;
+}
+
+
 int main(int argc, char **argv, char **envp) {
   atexit(llvm_shutdown);  // Call llvm_shutdown() on exit.
 
@@ -1349,13 +1520,25 @@ int main(int argc, char **argv, char **envp) {
     KleeHandler::loadPathFile(ReplayPathFile, replayPath);
   }
 
-  Interpreter::InterpreterOptions IOpts;
-  IOpts.MakeConcreteSymbolic = MakeConcreteSymbolic;
   KleeHandler *handler = new KleeHandler(pArgc, pArgv);
-  Interpreter *interpreter =
-    theInterpreter = Interpreter::create(ctx, IOpts, handler);
-  assert(interpreter);
-  handler->setInterpreter(interpreter);
+	KleeHandler *interpreterHandler = handler;
+
+  // Create solvers once, which are re-used by Executor instances.
+  Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);
+  if (!coreSolver) {
+    klee_error("Failed to create core solver\n");
+  }
+
+  Solver *solver = constructSolverChain(
+      coreSolver,
+      interpreterHandler->getOutputFilename(ALL_QUERIES_SMT2_FILE_NAME),
+      interpreterHandler->getOutputFilename(SOLVER_QUERIES_SMT2_FILE_NAME),
+      interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
+      interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
+
+  TimingSolver* timingSolver = new TimingSolver(solver, EqualitySubstitution); // this->solver, true
+
+  setup_monitor_directory();
 
   for (int i=0; i<argc; i++) {
     handler->getInfoStream() << argv[i] << (i+1<argc ? " ":"\n");
@@ -1364,18 +1547,20 @@ int main(int argc, char **argv, char **envp) {
 
   // Get the desired main function.  klee_main initializes uClibc
   // locale and other data and then calls main.
-
-  auto finalModule = interpreter->setModule(loadedModules, Opts);
+ 
+  auto finalModule = setModule(loadedModules, Opts, interpreterHandler);
   Function *mainFn = finalModule->getFunction(EntryPoint);
   if (!mainFn) {
     klee_error("Entry function '%s' not found in module.", EntryPoint.c_str());
   }
 
   externalsAndGlobalsCheck(finalModule);
+  ArrayCache* arrayCache = new ArrayCache(); // reused across Executor instances.
 
-  if (ReplayPathFile != "") {
+  /* Leaving Replay out for now */
+  /*if (ReplayPathFile != "") {
     interpreter->setReplayPath(&replayPath);
-  }
+  }*/
 
 
   auto startTime = std::time(nullptr);
@@ -1387,7 +1572,8 @@ int main(int argc, char **argv, char **envp) {
     handler->getInfoStream() << startInfo.str();
     handler->getInfoStream().flush();
   }
-
+  
+  /*
   if (!ReplayKTestDir.empty() || !ReplayKTestFile.empty()) {
     assert(SeedOutFile.empty());
     assert(SeedOutDir.empty());
@@ -1435,7 +1621,9 @@ int main(int argc, char **argv, char **envp) {
       kTest_free(kTests.back());
       kTests.pop_back();
     }
-  } else {
+  } else*/ {
+	  /*
+	  // Leave this out for now
     std::vector<KTest *> seeds;
     for (std::vector<std::string>::iterator
            it = SeedOutFile.begin(), ie = SeedOutFile.end();
@@ -1481,8 +1669,50 @@ int main(int argc, char **argv, char **envp) {
     while (!seeds.empty()) {
       kTest_free(seeds.back());
       seeds.pop_back();
-    }
+    } */
+
+	// Fork server mode
+  int i = 0;
+  while(!interrupted) {
+   std::string newSeed = blocking_get_new_seed_file();
+   errs() << "read seed: " << newSeed << "\n";
+   errs() << "iteration " << i << "\n";
+   MemoryObject::counter = 0; // same MemoryObject ids for all runs for debugging memory layout
+  
+   // Create a new Executor
+   Interpreter::InterpreterOptions IOpts;
+   IOpts.MakeConcreteSymbolic = MakeConcreteSymbolic;
+   Interpreter *interpreter =
+    theInterpreter = Interpreter::create(ctx, IOpts, handler, timingSolver, kmodule, specialFunctionHandler, statsTracker, arrayCache); // This calls the Executor() constructor
+   assert(interpreter);
+   handler->setInterpreter(interpreter);
+
+   std::vector<KTest *> seeds;
+   KTest *out = kTest_fromFile(newSeed.c_str());
+   if (!out) klee_error("unable to open: %s\n", newSeed.c_str());
+   seeds.push_back(out);
+	 assert(seeds.size() == 1 && "Seed error");
+   klee_message("KLEE: using %lu seeds\n", seeds.size());
+   interpreter->useSeeds(&seeds);
+
+   if (RunInDir != "") {
+     int res = chdir(RunInDir.c_str());
+     if (res < 0) {
+       klee_error("Unable to change directory to: %s - %s", RunInDir.c_str(),
+                  sys::StrError(errno).c_str());
+     }
+   }
+   errs() << "calling runFunctionAsMain\n";
+   interpreter->runFunctionAsMain(mainFn, pArgc, pArgv, pEnvp);
+
+   while (!seeds.empty()) {
+     kTest_free(seeds.back());
+     seeds.pop_back();
+   }
+   delete interpreter;
   }
+   cleanup_monitor_directory(0, nullptr);
+ }
 
   auto endTime = std::time(nullptr);
   { // output end and elapsed time
@@ -1508,7 +1738,7 @@ int main(int argc, char **argv, char **envp) {
     delete[] pArgv[i];
   delete[] pArgv;
 
-  delete interpreter;
+  // delete interpreter;
 
   uint64_t queries =
     *theStatisticManager->getStatisticByName("Queries");
@@ -1561,7 +1791,8 @@ int main(int argc, char **argv, char **envp) {
     llvm::errs().resetColor();
 
   handler->getInfoStream() << stats.str();
-
+  
+  delete arrayCache; 
   delete handler;
 
   return 0;

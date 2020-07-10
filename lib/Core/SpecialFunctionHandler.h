@@ -36,7 +36,8 @@ namespace klee {
                      std::pair<Handler,bool> > handlers_ty;
 
     handlers_ty handlers;
-    class Executor &executor;
+    class Executor *executor;
+    class KModule &kmodule;
 
     struct HandlerInfo {
       const char *name;
@@ -71,8 +72,9 @@ namespace klee {
 
 
   public:
-    SpecialFunctionHandler(Executor &_executor);
-
+    // SpecialFunctionHandler(Executor &_executor);
+    SpecialFunctionHandler(KModule &_kmodule);
+    void registerExecutor(Executor *_executor);
     /// Perform any modifications on the LLVM module before it is
     /// prepared for execution. At the moment this involves deleting
     /// unused function bodies and marking intrinsics with appropriate

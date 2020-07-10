@@ -32,6 +32,7 @@
 #include "klee/Expr/ExprPPrinter.h"
 #include "klee/Expr/ExprSMTLIBPrinter.h"
 #include "klee/Expr/ExprUtil.h"
+#include "klee/Expr/ArrayCache.h"
 #include "klee/Internal/ADT/KTest.h"
 #include "klee/Internal/ADT/RNG.h"
 #include "klee/Internal/Module/Cell.h"
@@ -152,11 +153,11 @@ cl::opt<bool>
                                 "from other constraints (default=false)"),
                        cl::cat(SolvingCat));
 
-cl::opt<bool>
-    EqualitySubstitution("equality-substitution", cl::init(true),
-                         cl::desc("Simplify equality expressions before "
-                                  "querying the solver (default=true)"),
-                         cl::cat(SolvingCat));
+//cl::opt<bool>
+//    EqualitySubstitution("equality-substitution", cl::init(true),
+//                         cl::desc("Simplify equality expressions before "
+//                                  "querying the solver (default=true)"),
+//                         cl::cat(SolvingCat));
 
 
 /*** External call policy options ***/
@@ -409,7 +410,7 @@ cl::opt<bool> DebugCheckForImpliedValues(
 } // namespace
 
 // testing
-bool CONCOLIC = false;
+bool CONCOLIC = true; // false;
 
 namespace klee {
   RNG theRNG;
@@ -436,16 +437,37 @@ const char *Executor::TerminateReasonNames[] = {
   [ Unhandled ] = "xxx",
 };
 
-
-Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
-                   InterpreterHandler *ih)
-    : Interpreter(opts), interpreterHandler(ih), searcher(0),
-      externalDispatcher(new ExternalDispatcher(ctx)), statsTracker(0),
-      pathWriter(0), symPathWriter(0), specialFunctionHandler(0), timers{time::Span(TimerInterval)},
-      replayKTest(0), replayPath(0), usingSeeds(0),
-      atMemoryLimit(false), inhibitForking(false), haltExecution(false),
-      ivcEnabled(false), debugLogBuffer(debugBufferString) {
-
+static int tries = 0;
+Executor::Executor(LLVMContext &ctx,
+	           const InterpreterOptions &opts,
+                   InterpreterHandler *ih,
+		   TimingSolver* s,
+		   KModule* kmodule,
+		   SpecialFunctionHandler *specialFunctionHandler,
+		   StatsTracker *statsTracker,
+		   ArrayCache* arrayCache)
+    : Interpreter(opts),
+      kmodule(kmodule),
+      interpreterHandler(ih),
+      searcher(0),
+      externalDispatcher(new ExternalDispatcher(ctx)),
+      solver(s),
+      statsTracker(statsTracker), /*statsTracker(0),*/
+      arrayCache(arrayCache),
+      specialFunctionHandler(specialFunctionHandler), /*specialFunctionHandler(0),*/
+      pathWriter(0),
+      symPathWriter(0),
+      timers{time::Span(TimerInterval)},
+      replayKTest(0),
+      replayPath(0),
+      usingSeeds(0),
+      atMemoryLimit(false),
+      inhibitForking(false),
+      haltExecution(false),
+      ivcEnabled(false),
+      debugLogBuffer(debugBufferString)
+  {
+  specialFunctionHandler->registerExecutor(this);
 
   const time::Span maxTime{MaxTime};
   if (maxTime) timers.add(
@@ -456,20 +478,8 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
 
   coreSolverTimeout = time::Span{MaxCoreSolverTime};
   if (coreSolverTimeout) UseForkedCoreSolver = true;
-  Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);
-  if (!coreSolver) {
-    klee_error("Failed to create core solver\n");
-  }
 
-  Solver *solver = constructSolverChain(
-      coreSolver,
-      interpreterHandler->getOutputFilename(ALL_QUERIES_SMT2_FILE_NAME),
-      interpreterHandler->getOutputFilename(SOLVER_QUERIES_SMT2_FILE_NAME),
-      interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
-      interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
-
-  this->solver = new TimingSolver(solver, EqualitySubstitution);
-  memory = new MemoryManager(&arrayCache);
+  memory = new MemoryManager(arrayCache);
 
   initializeSearchOptions();
 
@@ -499,75 +509,12 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
   }
 }
 
-llvm::Module *
-Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
-                    const ModuleOptions &opts) {
-  assert(!kmodule && !modules.empty() &&
-         "can only register one module"); // XXX gross
-
-  kmodule = std::unique_ptr<KModule>(new KModule());
-
-  // Preparing the final module happens in multiple stages
-
-  // Link with KLEE intrinsics library before running any optimizations
-  SmallString<128> LibPath(opts.LibraryDir);
-  llvm::sys::path::append(LibPath, "libkleeRuntimeIntrinsic.bca");
-  std::string error;
-  if (!klee::loadFile(LibPath.str(), modules[0]->getContext(), modules,
-                      error)) {
-    klee_error("Could not load KLEE intrinsic file %s", LibPath.c_str());
-  }
-
-  // 1.) Link the modules together
-  while (kmodule->link(modules, opts.EntryPoint)) {
-    // 2.) Apply different instrumentation
-    kmodule->instrument(opts);
-  }
-
-  // 3.) Optimise and prepare for KLEE
-
-  // Create a list of functions that should be preserved if used
-  std::vector<const char *> preservedFunctions;
-  specialFunctionHandler = new SpecialFunctionHandler(*this);
-  specialFunctionHandler->prepare(preservedFunctions);
-
-  preservedFunctions.push_back(opts.EntryPoint.c_str());
-
-  // Preserve the free-standing library calls
-  preservedFunctions.push_back("memset");
-  preservedFunctions.push_back("memcpy");
-  preservedFunctions.push_back("memcmp");
-  preservedFunctions.push_back("memmove");
-
-  kmodule->optimiseAndPrepare(opts, preservedFunctions);
-  kmodule->checkModule();
-
-  // 4.) Manifest the module
-  kmodule->manifest(interpreterHandler, StatsTracker::useStatistics());
-
-  specialFunctionHandler->bind();
-
-  if (StatsTracker::useStatistics() || userSearcherRequiresMD2U()) {
-    statsTracker = 
-      new StatsTracker(*this,
-                       interpreterHandler->getOutputFilename("assembly.ll"),
-                       userSearcherRequiresMD2U());
-  }
-
-  // Initialize the context.
-  DataLayout *TD = kmodule->targetData.get();
-  Context::initialize(TD->isLittleEndian(),
-                      (Expr::Width)TD->getPointerSizeInBits());
-
-  return kmodule->module.get();
-}
-
 Executor::~Executor() {
   delete memory;
   delete externalDispatcher;
-  delete specialFunctionHandler;
-  delete statsTracker;
-  delete solver;
+  //delete specialFunctionHandler;
+  //delete statsTracker;
+  //delete solver;
 }
 
 /***/
@@ -930,6 +877,7 @@ void Executor::branch(ExecutionState &state,
             interpreterHandler->processTestCase(*result[i], 0, 0);
           }
 
+          // The state will be terminated and the solver won't consider it further; we have saved a copy in otherState that is used for prioritized solving later on, though.
           terminateState(*result[i]);
           result[i] = NULL;
         }
@@ -1061,16 +1009,12 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
     }
     if (!(trueSeed && falseSeed)) {
       assert(trueSeed || falseSeed);
-      
+
       /* test concolic: called for if-statements */
       if (CONCOLIC) {
-        /* Note: we write the .ktest immediately. This has the benefit of free()'ing memory */
         ExecutionState otherState(current);
-        //assert(otherState && "new ExecutionState(current) failed");
         addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
-        // TODO: get value/process file and drop it
         interpreterHandler->processTestCase(otherState, 0, 0); // TODO: maybe create our own terminate function
-        //terminateState(*otherState);
         interpreterHandler->incPathsExplored(); // not sure this is correct
       }
 
@@ -2935,7 +2879,9 @@ void Executor::doDumpStates() {
 }
 
 void Executor::run(ExecutionState &initialState) {
-  bindModuleConstants();
+  if (tries==0)
+    bindModuleConstants(); // Only do this once, because we can reuse it.
+
 //errs() << "bindModules\n";
   // Delay init till now so that ticks don't accrue during optimization and such.
   timers.reset();
@@ -3004,6 +2950,8 @@ void Executor::run(ExecutionState &initialState) {
       return;
     }
   }
+	
+  assert(false && "Shouldn't reach this for the experiment\n");
 
   searcher = constructUserSearcher(*this);
 
@@ -3392,7 +3340,7 @@ ref<Expr> Executor::replaceReadWithSymbolic(ExecutionState &state,
   
   static unsigned id;
   const Array *array =
-      arrayCache.CreateArray("rrws_arr" + llvm::utostr(++id),
+      arrayCache->CreateArray("rrws_arr" + llvm::utostr(++id),
                              Expr::getMinBytesForWidth(e->getWidth()));
   ref<Expr> res = Expr::createTempRead(array, e->getWidth());
   ref<Expr> eq = NotOptimizedExpr::create(EqExpr::create(e, res));
@@ -3972,7 +3920,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     while (!state.arrayNames.insert(uniqueName).second) {
       uniqueName = name + "_" + llvm::utostr(++id);
     }
-    const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
+    const Array *array = arrayCache->CreateArray(uniqueName, mo->size);
     bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
     
@@ -4143,6 +4091,8 @@ void Executor::runFunctionAsMain(Function *f,
 
   if (statsTracker)
     statsTracker->done();
+
+  tries++;
 }
 
 unsigned Executor::getPathStreamID(const ExecutionState &state) {
@@ -4433,7 +4383,13 @@ void Executor::dumpStates() {
 
 ///
 
-Interpreter *Interpreter::create(LLVMContext &ctx, const InterpreterOptions &opts,
-                                 InterpreterHandler *ih) {
-  return new Executor(ctx, opts, ih);
+Interpreter *Interpreter::create(LLVMContext &ctx,
+                                 const InterpreterOptions &opts,
+                                 InterpreterHandler *ih,
+                                 TimingSolver* s,
+                                 KModule* kmodule,
+                                 SpecialFunctionHandler *specialFunctionHandler,
+                                 StatsTracker *statsTracker,
+                                 ArrayCache* arrayCache){
+  return new Executor(ctx, opts, ih, s, kmodule, specialFunctionHandler, statsTracker, arrayCache);
 }

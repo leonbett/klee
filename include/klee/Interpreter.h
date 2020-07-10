@@ -14,6 +14,9 @@
 #include <set>
 #include <string>
 #include <vector>
+#include "../lib/Core/TimingSolver.h"
+#include "../lib/Core/StatsTracker.h"
+#include "../lib/Core/SpecialFunctionHandler.h"
 
 struct KTest;
 
@@ -29,6 +32,8 @@ namespace klee {
 class ExecutionState;
 class Interpreter;
 class TreeStreamWriter;
+class KModule;
+class ArrayCache;
 
 class InterpreterHandler {
 public:
@@ -96,17 +101,22 @@ public:
   virtual ~Interpreter() {}
 
   static Interpreter *create(llvm::LLVMContext &ctx,
-                             const InterpreterOptions &_interpreterOpts,
-                             InterpreterHandler *ih);
+                             const InterpreterOptions &interpreterOpts,
+                             InterpreterHandler *ih,
+                             TimingSolver* s,
+                             klee::KModule* kmodule,
+                             SpecialFunctionHandler *specialFunctionHandler,
+                             StatsTracker *statsTracker,
+			     ArrayCache* arrayCache);
 
   /// Register the module to be executed.
   /// \param modules A list of modules that should form the final
   ///                module
   /// \return The final module after it has been optimized, checks
   /// inserted, and modified for interpretation.
-  virtual llvm::Module *
-  setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
-            const ModuleOptions &opts) = 0;
+  //virtual llvm::Module *
+  //setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
+  //          const ModuleOptions &opts) = 0;
 
   // supply a tree stream writer which the interpreter will use
   // to record the concrete path (as a stream of '0' and '1' bytes).
