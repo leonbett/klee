@@ -438,7 +438,6 @@ const char *Executor::TerminateReasonNames[] = {
 };
 
 static int tries = 0;
-bool enteredDevMain = false;
 Executor::Executor(LLVMContext &ctx,
 	           const InterpreterOptions &opts,
                    InterpreterHandler *ih,
@@ -468,7 +467,6 @@ Executor::Executor(LLVMContext &ctx,
       ivcEnabled(false),
       debugLogBuffer(debugBufferString)
   {
-  enteredDevMain = false; // Must be reset; previous Executor instance will have set it to true, leading to problems with undefined memory in uclibc before user main is reached.
   specialFunctionHandler->registerExecutor(this);
 
   const time::Span maxTime{MaxTime};
@@ -520,6 +518,7 @@ Executor::~Executor() {
 }
 
 /***/
+bool enteredDevMain = false;
 void Executor::initializeGlobalObject(ExecutionState &state, ObjectState *os,
                                       const Constant *c, 
                                       unsigned offset, const bool print) {

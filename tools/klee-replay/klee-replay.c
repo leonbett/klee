@@ -502,6 +502,10 @@ int klee_range(int start, int end, const char* name) {
   }
 }
 
+void klee_ignore_undefined(void *addr, size_t nbytes) {
+  ; // included here to make klee-replay build
+}
+
 void klee_report_error(const char *file, int line,
                        const char *message, const char *suffix) {
   __emit_error(message);
