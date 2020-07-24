@@ -49,6 +49,15 @@ cl::opt<bool>
                               "condition given to klee_assume() rather than "
                               "emitting an error (default=false)"),
                      cl::cat(TerminationCat));
+
+cl::opt<bool>
+    DisableUBSANCheck("disable-ubsan-check", cl::init(false),
+                  cl::desc("Sometimes replaying a seed already triggers "
+                           "an UBSAN violation. By default this terminates "
+                           "the state. If this option is set to true, a "
+                           "warning will be printed instead, allowing the "
+                           "seed to be explored. (default=false)"),
+                  cl::cat(TerminationCat));  
 } // namespace
 
 /// \todo Almost all of the demands in this file should be replaced
@@ -940,27 +949,35 @@ void SpecialFunctionHandler::handleMarkGlobal(ExecutionState &state,
 void SpecialFunctionHandler::handleAddOverflow(ExecutionState &state,
                                                KInstruction *target,
                                                std::vector<ref<Expr> > &arguments) {
-  executor.terminateStateOnError(state, "overflow on addition",
-                                 Executor::Overflow);
+  if (DisableUBSANCheck)
+    klee_warning("overflow on addition");
+  else
+    executor.terminateStateOnError(state, "overflow on addition", Executor::Overflow);
 }
 
 void SpecialFunctionHandler::handleSubOverflow(ExecutionState &state,
                                                KInstruction *target,
                                                std::vector<ref<Expr> > &arguments) {
-  executor.terminateStateOnError(state, "overflow on subtraction",
-                                 Executor::Overflow);
+  if (DisableUBSANCheck)
+    klee_warning("overflow on subtraction");
+  else                                              
+    executor.terminateStateOnError(state, "overflow on subtraction", Executor::Overflow);
 }
 
 void SpecialFunctionHandler::handleMulOverflow(ExecutionState &state,
                                                KInstruction *target,
                                                std::vector<ref<Expr> > &arguments) {
-  executor.terminateStateOnError(state, "overflow on multiplication",
-                                 Executor::Overflow);
+  if (DisableUBSANCheck)
+    klee_warning("overflow on multiplication");
+  else                                                
+    executor.terminateStateOnError(state, "overflow on multiplication", Executor::Overflow);
 }
 
 void SpecialFunctionHandler::handleDivRemOverflow(ExecutionState &state,
                                                KInstruction *target,
                                                std::vector<ref<Expr> > &arguments) {
-  executor.terminateStateOnError(state, "overflow on division or remainder",
-                                 Executor::Overflow);
+  if (DisableUBSANCheck)
+    klee_warning("overflow on division or remainder");
+  else      
+    executor.terminateStateOnError(state, "overflow on division or remainder", Executor::Overflow);
 }

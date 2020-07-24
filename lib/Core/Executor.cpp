@@ -409,7 +409,7 @@ cl::opt<bool> DebugCheckForImpliedValues(
 } // namespace
 
 // testing
-bool CONCOLIC = false;
+bool CONCOLIC = true;
 
 namespace klee {
   RNG theRNG;
