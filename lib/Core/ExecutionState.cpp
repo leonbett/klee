@@ -7,16 +7,16 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "ExecutionState.h"
+
 #include "Memory.h"
 
-#include "klee/ExecutionState.h"
-
 #include "klee/Expr/Expr.h"
-#include "klee/Internal/Module/Cell.h"
-#include "klee/Internal/Module/InstructionInfoTable.h"
-#include "klee/Internal/Module/KInstruction.h"
-#include "klee/Internal/Module/KModule.h"
-#include "klee/OptionCategories.h"
+#include "klee/Module/Cell.h"
+#include "klee/Module/InstructionInfoTable.h"
+#include "klee/Module/KInstruction.h"
+#include "klee/Module/KModule.h"
+#include "klee/Support/OptionCategories.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/Support/CommandLine.h"
@@ -38,6 +38,10 @@ cl::opt<bool> DebugLogStateMerge(
     cl::desc("Debug information for underlying state merging (default=false)"),
     cl::cat(MergeCat));
 }
+
+/***/
+
+std::uint32_t ExecutionState::nextID = 1;
 
 /***/
 
@@ -68,22 +72,18 @@ StackFrame::~StackFrame() {
 ExecutionState::ExecutionState(KFunction *kf) :
     pc(kf->instructions),
     prevPC(pc),
-
     depth(0),
-
+    ptreeNode(nullptr),
+    steppedInstructions(0),
     instsSinceCovNew(0),
     coveredNew(false),
-    forkDisabled(false),
-    ptreeNode(0),
-    steppedInstructions(0){
-  pushFrame(0, kf);
+    forkDisabled(false) {
+  pushFrame(nullptr, kf);
+  setID();
 }
 
-ExecutionState::ExecutionState(const std::vector<ref<Expr> > &assumptions)
-    : constraints(assumptions), ptreeNode(0) {}
-
 ExecutionState::~ExecutionState() {
-  for (auto cur_mergehandler: openMergeStack){
+  for (const auto &cur_mergehandler: openMergeStack){
     cur_mergehandler->removeOpenState(this);
   }
 
@@ -95,33 +95,28 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     prevPC(state.prevPC),
     stack(state.stack),
     incomingBBIndex(state.incomingBBIndex),
-
+    depth(state.depth),
     addressSpace(state.addressSpace),
     constraints(state.constraints),
-
-    queryCost(state.queryCost),
-    depth(state.depth),
-
     pathOS(state.pathOS),
     symPathOS(state.symPathOS),
-
-    instsSinceCovNew(state.instsSinceCovNew),
-    coveredNew(state.coveredNew),
-    forkDisabled(state.forkDisabled),
     coveredLines(state.coveredLines),
-    ptreeNode(state.ptreeNode),
     symbolics(state.symbolics),
     arrayNames(state.arrayNames),
     openMergeStack(state.openMergeStack),
-    steppedInstructions(state.steppedInstructions) {
-  for (auto cur_mergehandler: openMergeStack)
+    steppedInstructions(state.steppedInstructions),
+    instsSinceCovNew(state.instsSinceCovNew),
+    coveredNew(state.coveredNew),
+    forkDisabled(state.forkDisabled) {
+  for (const auto &cur_mergehandler: openMergeStack)
     cur_mergehandler->addOpenState(this);
 }
 
 ExecutionState *ExecutionState::branch() {
   depth++;
 
-  ExecutionState *falseState = new ExecutionState(*this);
+  auto *falseState = new ExecutionState(*this);
+  falseState->setID();
   falseState->coveredNew = false;
   falseState->coveredLines.clear();
 
@@ -129,19 +124,18 @@ ExecutionState *ExecutionState::branch() {
 }
 
 void ExecutionState::pushFrame(KInstIterator caller, KFunction *kf) {
-  stack.push_back(StackFrame(caller,kf));
+  stack.emplace_back(StackFrame(caller, kf));
 }
 
 void ExecutionState::popFrame() {
-  StackFrame &sf = stack.back();
-  for (std::vector<const MemoryObject*>::iterator it = sf.allocas.begin(), 
-         ie = sf.allocas.end(); it != ie; ++it)
-    addressSpace.unbindObject(*it);
+  const StackFrame &sf = stack.back();
+  for (const auto * memoryObject : sf.allocas)
+    addressSpace.unbindObject(memoryObject);
   stack.pop_back();
 }
 
 void ExecutionState::addSymbolic(const MemoryObject *mo, const Array *array) {
-  symbolics.emplace_back(std::make_pair(ref<const MemoryObject>(mo), array));
+  symbolics.emplace_back(ref<const MemoryObject>(mo), array);
 }
 
 /**/
@@ -312,11 +306,12 @@ bool ExecutionState::merge(const ExecutionState &b) {
     }
   }
 
-  constraints = ConstraintManager();
-  for (std::set< ref<Expr> >::iterator it = commonConstraints.begin(), 
-         ie = commonConstraints.end(); it != ie; ++it)
-    constraints.addConstraint(*it);
-  constraints.addConstraint(OrExpr::create(inA, inB));
+  constraints = ConstraintSet();
+
+  ConstraintManager m(constraints);
+  for (const auto &constraint : commonConstraints)
+    m.addConstraint(constraint);
+  m.addConstraint(OrExpr::create(inA, inB));
 
   return true;
 }
@@ -353,4 +348,9 @@ void ExecutionState::dumpStack(llvm::raw_ostream &out) const {
     out << "\n";
     target = sf.caller;
   }
+}
+
+void ExecutionState::addConstraint(ref<Expr> e) {
+  ConstraintManager c(constraints);
+  c.addConstraint(e);
 }

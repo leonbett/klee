@@ -10,21 +10,22 @@
 #include "Searcher.h"
 
 #include "CoreStats.h"
+#include "ExecutionState.h"
 #include "Executor.h"
+#include "MergeHandler.h"
 #include "PTree.h"
 #include "StatsTracker.h"
 
-#include "klee/ExecutionState.h"
-#include "klee/MergeHandler.h"
-#include "klee/Statistics.h"
-#include "klee/Internal/Module/InstructionInfoTable.h"
-#include "klee/Internal/Module/KInstruction.h"
-#include "klee/Internal/Module/KModule.h"
-#include "klee/Internal/ADT/DiscretePDF.h"
-#include "klee/Internal/ADT/RNG.h"
-#include "klee/Internal/Support/ModuleUtil.h"
-#include "klee/Internal/System/Time.h"
-#include "klee/Internal/Support/ErrorHandling.h"
+#include "klee/ADT/DiscretePDF.h"
+#include "klee/ADT/RNG.h"
+#include "klee/Statistics/Statistics.h"
+#include "klee/Module/InstructionInfoTable.h"
+#include "klee/Module/KInstruction.h"
+#include "klee/Module/KModule.h"
+#include "klee/Support/ErrorHandling.h"
+#include "klee/Support/ModuleUtil.h"
+#include "klee/System/Time.h"
+
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
@@ -213,7 +214,9 @@ double WeightedRandomSearcher::getWeight(ExecutionState *es) {
     return inv;
   }
   case QueryCost:
-    return (es->queryCost.toSeconds() < .1) ? 1. : 1./ es->queryCost.toSeconds();
+    return (es->queryMetaData.queryCost.toSeconds() < .1)
+               ? 1.
+               : 1. / es->queryMetaData.queryCost.toSeconds();
   case CoveringNew:
   case MinDistToUncovered: {
     uint64_t md2u = computeMinDistToUncovered(es->pc,
@@ -258,29 +261,37 @@ bool WeightedRandomSearcher::empty() {
   return states->empty(); 
 }
 
-///
-RandomPathSearcher::RandomPathSearcher(Executor &_executor)
-  : executor(_executor) {
-}
+RandomPathSearcher::RandomPathSearcher(PTree &_processTree)
+    : processTree(_processTree), idBitMask(_processTree.getNextId()) {}
 
 RandomPathSearcher::~RandomPathSearcher() {
 }
+// Check if n is a valid pointer and a node belonging to us
+#define IS_OUR_NODE_VALID(n)                                                   \
+  (((n).getPointer() != nullptr) && (((n).getInt() & idBitMask) != 0))
 
 ExecutionState &RandomPathSearcher::selectState() {
   unsigned flips=0, bits=0;
-  PTreeNode *n = executor.processTree->root.get();
+  assert(processTree.root.getInt() & idBitMask &&
+         "Root should belong to the searcher");
+  PTreeNode *n = processTree.root.getPointer();
   while (!n->state) {
-    if (!n->left) {
-      n = n->right.get();
-    } else if (!n->right) {
-      n = n->left.get();
+    if (!IS_OUR_NODE_VALID(n->left)) {
+      assert(IS_OUR_NODE_VALID(n->right) &&
+             "Both left and right nodes invalid");
+      assert(n != n->right.getPointer());
+      n = n->right.getPointer();
+    } else if (!IS_OUR_NODE_VALID(n->right)) {
+      assert(IS_OUR_NODE_VALID(n->left) && "Both right and left nodes invalid");
+      assert(n != n->left.getPointer());
+      n = n->left.getPointer();
     } else {
       if (bits==0) {
         flips = theRNG.getInt32();
         bits = 32;
       }
       --bits;
-      n = (flips&(1<<bits)) ? n->left.get() : n->right.get();
+      n = ((flips & (1 << bits)) ? n->left : n->right).getPointer();
     }
   }
 
@@ -291,10 +302,46 @@ void
 RandomPathSearcher::update(ExecutionState *current,
                            const std::vector<ExecutionState *> &addedStates,
                            const std::vector<ExecutionState *> &removedStates) {
+  for (auto es : addedStates) {
+    PTreeNode *pnode = es->ptreeNode, *parent = pnode->parent;
+    PTreeNodePtr *childPtr;
+
+    childPtr = parent ? ((parent->left.getPointer() == pnode) ? &parent->left
+                                                              : &parent->right)
+                      : &processTree.root;
+    while (pnode && !IS_OUR_NODE_VALID(*childPtr)) {
+      childPtr->setInt(childPtr->getInt() | idBitMask);
+      pnode = parent;
+      if (pnode)
+        parent = pnode->parent;
+
+      childPtr = parent
+                     ? ((parent->left.getPointer() == pnode) ? &parent->left
+                                                             : &parent->right)
+                     : &processTree.root;
+    }
+  }
+
+  for (auto es : removedStates) {
+    PTreeNode *pnode = es->ptreeNode, *parent = pnode->parent;
+
+    while (pnode && !IS_OUR_NODE_VALID(pnode->left) &&
+           !IS_OUR_NODE_VALID(pnode->right)) {
+      auto childPtr =
+          parent ? ((parent->left.getPointer() == pnode) ? &parent->left
+                                                         : &parent->right)
+                 : &processTree.root;
+      assert(IS_OUR_NODE_VALID(*childPtr) && "Removing pTree child not ours");
+      childPtr->setInt(childPtr->getInt() & ~idBitMask);
+      pnode = parent;
+      if (pnode)
+        parent = pnode->parent;
+    }
+  }
 }
 
-bool RandomPathSearcher::empty() { 
-  return executor.states.empty(); 
+bool RandomPathSearcher::empty() {
+  return !IS_OUR_NODE_VALID(processTree.root);
 }
 
 ///

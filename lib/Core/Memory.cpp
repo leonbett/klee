@@ -10,14 +10,15 @@
 #include "Memory.h"
 
 #include "Context.h"
+#include "ExecutionState.h"
 #include "MemoryManager.h"
 
+#include "klee/ADT/BitArray.h"
 #include "klee/Expr/ArrayCache.h"
 #include "klee/Expr/Expr.h"
-#include "klee/Internal/Support/ErrorHandling.h"
-#include "klee/OptionCategories.h"
+#include "klee/Support/OptionCategories.h"
 #include "klee/Solver/Solver.h"
-#include "klee/util/BitArray.h"
+#include "klee/Support/ErrorHandling.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
@@ -196,7 +197,8 @@ void ObjectState::flushToConcreteStore(TimingSolver *solver,
   for (unsigned i = 0; i < size; i++) {
     if (isByteKnownSymbolic(i)) {
       ref<ConstantExpr> ce;
-      bool success = solver->getValue(state, read8(i), ce);
+      bool success = solver->getValue(state.constraints, read8(i), ce,
+                                      state.queryMetaData);
       if (!success)
         klee_warning("Solver timed out when getting a value for external call, "
                      "byte %p+%u will have random value",
