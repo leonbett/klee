@@ -127,6 +127,12 @@ namespace {
                               "These options affect how execution is started.");
 
   cl::opt<std::string>
+  RawSyncDir("sync-dir",
+            cl::desc("Directory where KLEE will output generated raw testcases to interface with a fuzzer."),
+            cl::init(""),
+            cl::cat(StartCat));
+
+  cl::opt<std::string>
   EntryPoint("entry-point",
              cl::desc("Function in which to start execution (default=main)"),
              cl::init("main"),
@@ -507,6 +513,17 @@ void KleeHandler::processTestCase(const ExecutionState &state,
         klee_warning("unable to write output test case, losing it");
       } else {
         ++m_numGeneratedTests;
+
+        // Output test cases in raw format    
+        if (b.numObjects > 0 && RawSyncDir != "") {
+					SmallString<128> path(RawSyncDir);
+					sys::path::append(path, getTestFilename("raw", id));
+					// Assumption: path exists; must be created by coordinator.
+					FILE *fRaw = fopen(path.c_str(), "wb");
+					KTestObject *o = &b.objects[0];
+					fwrite(o->bytes, o->numBytes, 1, fRaw);
+					fclose(fRaw);
+        }
       }
 
       for (unsigned i=0; i<b.numObjects; i++)
