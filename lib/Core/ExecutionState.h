@@ -70,10 +70,12 @@ public:
 #else
 private:
 #endif
-  // copy ctor
-  ExecutionState(const ExecutionState &state);
+
 
 public:
+  // copy ctor
+  ExecutionState(const ExecutionState &state);
+  
   using stack_ty = std::vector<StackFrame>;
 
   // Execution - Control Flow specific
