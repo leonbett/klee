@@ -414,6 +414,8 @@ cl::opt<bool> DebugCheckForImpliedValues(
 
 } // namespace
 
+bool CONCOLIC = true;
+
 namespace klee {
   RNG theRNG;
 }
@@ -937,6 +939,13 @@ void Executor::branch(ExecutionState &state,
     if (OnlyReplaySeeds) {
       for (unsigned i=0; i<N; ++i) {
         if (result[i] && !seedMap.count(result[i])) {
+          if (CONCOLIC) {
+            //errs() << "writing test case for condition:" << conditions[i] << "\n";
+            errs() << "Solved concolic branch\n"; // TODO: dump branch/edge id, calculated from metadata nodes 
+            addConstraint(*result[i], conditions[i]);
+            interpreterHandler->processTestCase(*result[i], 0, 0);
+          }
+
           terminateState(*result[i]);
           result[i] = NULL;
         }
@@ -1058,6 +1067,14 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
     }
     if (!(trueSeed && falseSeed)) {
       assert(trueSeed || falseSeed);
+
+      /* test concolic: called for if-statements */
+      if (CONCOLIC) {
+        ExecutionState otherState(current);
+        addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
+        interpreterHandler->processTestCase(otherState, 0, 0); // TODO: maybe create our own terminate function
+        interpreterHandler->incPathsExplored(); // not sure this is correct
+      }
       
       res = trueSeed ? Solver::True : Solver::False;
       addConstraint(current, trueSeed ? condition : Expr::createIsZero(condition));

@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "klee/ADT/KTest.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -210,6 +211,8 @@ int kTest_toFile(KTest *bo, const char *path) {
       goto error;
   }
 
+  llvm::errs() << "Wrote " << ftell(f) << " bytes to " << path << "\n";
+  
   fclose(f);
 
   return 1;
