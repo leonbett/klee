@@ -630,6 +630,8 @@ MemoryObject * Executor::addExternalObject(ExecutionState &state,
 }
 
 
+
+
 extern void *__dso_handle __attribute__ ((__weak__));
 
 void Executor::initializeGlobals(ExecutionState &state) {
@@ -806,6 +808,42 @@ void Executor::initializeGlobals(ExecutionState &state) {
   }
 }
 
+std::set<uint64_t> CovEdges;
+uint64_t getBBID(BasicBlock& bb) {
+  for (Instruction& instr : bb) {
+    MDNode* md = instr.getMetadata("afl_cur_loc");
+    if (md) return mdconst::dyn_extract<ConstantInt>(md->getOperand(0))->getZExtValue();
+  }
+  // errs() << "afl_cur_loc not found\n"; // e.g., library
+  return 0;
+}
+
+uint64_t getEdgeID(BasicBlock* prevBB, BasicBlock* curBB) {
+  uint64_t bbid_src = getBBID(*prevBB);
+  uint64_t bbid_dest = getBBID(*curBB);
+  if (bbid_src && bbid_dest) {
+    // errs() << "bbid_src: " << bbid_src << "\n";
+    // errs() << "bbid_dest: " << bbid_dest << "\n";
+    return (bbid_src >> 1) ^ bbid_dest;
+  }
+  return 0;
+}
+
+uint64_t getEdgeID(ExecutionState& state) {
+  Instruction* prevInstr = state.prevPC->inst;
+	Instruction* curInstr = state.pc->inst;
+  BasicBlock* prevBB = prevInstr->getParent();
+	BasicBlock* curBB = curInstr->getParent();
+  assert((prevInstr->getOpcode() == Instruction::Br || prevInstr->getOpcode() == Instruction::Switch)  && "should always be br/switch/?"); // todo check if conditional br
+  return getEdgeID(prevBB, curBB);
+}
+
+void log_edge(uint64_t edge_id) {
+  errs() << "log edgeid: " << edge_id << "\n";
+  CovEdges.insert(edge_id);
+}
+
+
 void Executor::branch(ExecutionState &state, 
                       const std::vector< ref<Expr> > &conditions,
                       std::vector<ExecutionState*> &result) {
@@ -881,10 +919,16 @@ void Executor::branch(ExecutionState &state,
       for (unsigned i=0; i<N; ++i) {
         if (result[i] && !seedMap.count(result[i])) {
           if (CONCOLIC) {
-            //errs() << "writing test case for condition:" << conditions[i] << "\n";
-            errs() << "Solved concolic branch\n"; // TODO: dump branch/edge id, calculated from metadata nodes 
-            addConstraint(*result[i], conditions[i]);
-            interpreterHandler->processTestCase(*result[i], 0, 0);
+            uint64_t edge_id = getEdgeID(*result[i]);
+            const bool bEdgeCovered = CovEdges.find(edge_id) != CovEdges.end();
+            if (!bEdgeCovered) {
+              //errs() << "writing test case for condition:" << conditions[i] << "\n";
+              errs() << "Solving concolic branch\n"; 
+              addConstraint(*result[i], conditions[i]);
+              interpreterHandler->processTestCase(*result[i], 0, 0);
+              log_edge(edge_id);
+            }
+            else klee_message("Skip: edge %lu was already covered in a previous run", edge_id);
           }
           terminateState(*result[i]);
           result[i] = NULL;
@@ -1020,12 +1064,27 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
 
       /* test concolic: called for if-statements */
       if (CONCOLIC) {
-        ExecutionState otherState(current);
-        addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
-        interpreterHandler->processTestCase(otherState, 0, 0); // TODO: maybe create our own terminate function
-        interpreterHandler->incPathsExplored(); // not sure this is correct
+        Instruction* prevInstr = current.prevPC->inst;
+        BasicBlock* prevBB = prevInstr->getParent();
+        assert((prevInstr->getOpcode() == Instruction::Br) && "Should be after executing br?");
+        BranchInst *bi = cast<BranchInst>(prevInstr);
+
+        // Get the bb that 'could' be reached by flipping the edge
+        // branch condition true -> pass execution to getSuccessor(0)
+        // branch condition false -> pass execution to getSuccessor(1)
+        BasicBlock* reachableByFlipping = bi->getSuccessor(trueSeed?1:0); // flipped successor
+        uint64_t edge_id = getEdgeID(prevBB, reachableByFlipping);
+        const bool bEdgeCovered = CovEdges.find(edge_id) != CovEdges.end();
+        if (!bEdgeCovered) {
+          ExecutionState otherState(current);
+          addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
+          interpreterHandler->processTestCase(otherState, 0, 0); // TODO: maybe create our own terminate function
+          interpreterHandler->incPathsExplored(); // not sure this is correct
+          log_edge(edge_id); // TODO: check if solving was successful
+        }
+        else klee_message("Skip-2: edge %lu was already covered in a previous run", edge_id);
       }
-      
+
       res = trueSeed ? Solver::True : Solver::False;
       addConstraint(current, trueSeed ? condition : Expr::createIsZero(condition));
     }
@@ -3471,7 +3530,6 @@ void Executor::executeAlloc(ExecutionState &state,
         break;
       example = tmp;
     }
-
     StatePair fixedSize = fork(state, EqExpr::create(example, size), true);
     
     if (fixedSize.second) { 
@@ -3565,7 +3623,6 @@ void Executor::resolveExact(ExecutionState &state,
   for (ResolutionList::iterator it = rl.begin(), ie = rl.end(); 
        it != ie; ++it) {
     ref<Expr> inBounds = EqExpr::create(p, it->first->getBaseExpr());
-    
     StatePair branches = fork(*unbound, inBounds, true);
     
     if (branches.first)
@@ -3952,6 +4009,8 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
   // the preferred constraints.  See test/Features/PreferCex.c for
   // an example) While this process can be very expensive, it can
   // also make understanding individual test cases much easier.
+
+  // TODO: copy unconstrained bytes from seed to test cases
   for (unsigned i = 0; i != state.symbolics.size(); ++i) {
     const MemoryObject *mo = state.symbolics[i].first;
     std::vector< ref<Expr> >::const_iterator pi = 
