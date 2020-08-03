@@ -252,12 +252,24 @@ cl::opt<std::string>
                       "search (default=0s (off))"),
              cl::cat(SeedingCat));
 
-cl::list<unsigned>
-    ParamInterestingEdges("interesting-edge",
-                  cl::desc("Interesting edge id, which concolic execution "
-                           "will try to solve."),
-                  cl::value_desc("64bit edge id"),
-                  cl::cat(SeedingCat));
+cl::opt<std::string>
+    InterestingEdgesFile("interesting-edges-file",
+              cl::desc("File containing a list of interesting edge id's, "
+                        "which concolic execution will try to solve."),
+              cl::cat(SeedingCat));
+
+ cl::opt<std::string>
+    CoveredEdgesFile_in("cov-edges-in-file",
+              cl::desc("File containing a list of edge ids, "
+                        "and a counter expressing how often "
+                        "they have been hit by a single input. "),
+              cl::cat(SeedingCat));
+
+ cl::opt<std::string>
+    CoveredEdgesFile_out("cov-edges-out-file",
+              cl::desc("Write covered edges and hit count "
+                        "to this file."),
+              cl::cat(SeedingCat));
 
 /*** Termination criteria options ***/
 
@@ -816,14 +828,63 @@ void Executor::initializeGlobals(ExecutionState &state) {
 
 std::set<uint64_t> CovEdges;
 std::set<uint64_t> InterestingEdges;
+std::set<uint64_t> CovEdgesInPreviousRuns;
+std::set<uint64_t> CovEdgesInThisRun;
+//std::unordered_map<uint64_t, uint8_t> PreviouslyCovEdges;
+//std::unordered_map<uint64_t, uint64_t> CurrentlyCovEdges;
+
 
 void serializeCovEdges() {
   std::ofstream f;
-  f.open("coveredEdges.txt");
+  f.open(CoveredEdgesFile_out);
+  if (!f) {
+    errs() << "Warning: Could not open covered edges file for outputting: " << CoveredEdgesFile_out << "\n";
+    return;
+  }
+
   errs() << "Dumping CovEdges\n";
-  for (const auto& it: CovEdges) {
-    errs() << it << "\n";
-    f << it << "\n";
+  for (const auto& it: CovEdgesInThisRun) {
+    errs() << it << ",1\n";
+    f << it << ",1\n";
+  }
+  f.close();
+}
+
+void readCovEdges() {
+  std::ifstream f;
+  f.open(CoveredEdgesFile_in); // other file name?
+  if (!f) {
+    errs() << "Warning: Could not open covered edges file: " << CoveredEdgesFile_in << "\n";
+    return;
+  }
+
+  errs() << "Reading covered edges\n";
+  uint64_t edge_id;
+  uint8_t hit_count;
+  char delimiter;
+  while ((f >> edge_id >> delimiter >> hit_count) && (delimiter == ',')) {
+    //PreviouslyCovEdges[edge_id] = hit_count;
+    CovEdgesInPreviousRuns.insert(edge_id); // ignoring hit_count for now.
+    errs() << "covered: " << edge_id << ", " << hit_count << "\n";
+
+  }
+  f.close();
+}
+
+//Format: "({64bit-edge id}\n)*"
+void readInterestingEdges() {
+  std::ifstream f;
+  f.open(InterestingEdgesFile);
+  if (!f) {
+    errs() << "Warning: Could not open interesting-edges-file: " << InterestingEdgesFile << "\n";
+    return;
+  }
+  errs() << "Reading interesting edges\n";
+  uint64_t edge_id;
+  char delimiter;
+  while (f >> edge_id) {
+    InterestingEdges.insert(edge_id);
+    errs() << "interesting: " << edge_id << "\n";
   }
   f.close();
 }
@@ -845,14 +906,22 @@ uint64_t getReachableSanitizerLocations(BasicBlock& bb) {
   return getMetadata(bb, "savior_bug_num");
 }
 
+// If a BB has the "afl_edge_sanitizer metadata, then it has an edge that directly reaches UBSAN violation handler code."
+bool BBHasSanitizerEdge(BasicBlock& bb) {
+  for (Instruction& instr : bb) {
+    if (instr.getMetadata("afl_edge_sanitizer") != nullptr) return true; // hasMetadata()
+  }
+  return false;
+}
+
 uint64_t getReachableSanitizerLocations(ExecutionState& state) {
   BasicBlock* bb = state.pc->inst->getParent();
   return getReachableSanitizerLocations(*bb);
 }
 
-uint64_t getEdgeID(BasicBlock* prevBB, BasicBlock* curBB) {
-  uint64_t bbid_src = getBBID(*prevBB);
-  uint64_t bbid_dest = getBBID(*curBB);
+uint64_t getEdgeID(BasicBlock* srcBB, BasicBlock* destBB) {
+  uint64_t bbid_src = getBBID(*srcBB);
+  uint64_t bbid_dest = getBBID(*destBB);
   if (bbid_src && bbid_dest) {
     // errs() << "bbid_src: " << bbid_src << "\n";
     // errs() << "bbid_dest: " << bbid_dest << "\n";
@@ -861,6 +930,7 @@ uint64_t getEdgeID(BasicBlock* prevBB, BasicBlock* curBB) {
   return 0;
 }
 
+/*
 uint64_t getEdgeID(ExecutionState& state) {
   Instruction* prevInstr = state.prevPC->inst;
 	Instruction* curInstr = state.pc->inst;
@@ -869,10 +939,46 @@ uint64_t getEdgeID(ExecutionState& state) {
   assert((prevInstr->getOpcode() == Instruction::Br || prevInstr->getOpcode() == Instruction::Switch)  && "should always be br/switch/?"); // todo check if conditional br
   return getEdgeID(prevBB, curBB);
 }
+*/
 
-void log_edge(uint64_t edge_id) {
+void logEdge(uint64_t edge_id) {
   errs() << "log edgeid: " << edge_id << "\n";
-  CovEdges.insert(edge_id);
+  CovEdgesInThisRun.insert(edge_id);
+  //CurrentlyCovEdges[edge_id]++;
+}
+
+
+// We're only interested in edges from conditional branch or switch instructions.
+void logEdge(ExecutionState& state) {
+  Instruction *prevInstr, *curInstr;
+  if (state.pc && (curInstr=state.pc->inst) && state.prevPC && (prevInstr=state.prevPC->inst)) {
+    bool bConditionalBranch = false;
+    if (prevInstr->getOpcode() == Instruction::Br) {
+      BranchInst *bi = cast<BranchInst>(prevInstr);
+      bConditionalBranch = bi->isConditional();
+    }
+    if (bConditionalBranch || prevInstr->getOpcode() == Instruction::Switch) {
+      uint64_t edge_id = getEdgeID(prevInstr->getParent(), curInstr->getParent());
+      logEdge(edge_id);
+    }
+  }
+}
+
+bool makesSenseToFlipEdge(BasicBlock* srcBB, BasicBlock* destBB) {
+  uint64_t edge_id = getEdgeID(srcBB, destBB);
+
+  const bool bEdgeInteresting = InterestingEdges.find(edge_id) != InterestingEdges.end();
+  if (bEdgeInteresting) return true; // interesting edges are passed as parameter to KLEE
+  if (BBHasSanitizerEdge(*srcBB)) return true; // BB has edge that can directly reach UBSAN violation handler
+
+  const bool bEdgeCoveredInThisRun = CovEdgesInThisRun.find(edge_id) != CovEdgesInThisRun.end();
+  if (bEdgeCoveredInThisRun) return false; // edge covered already
+  const bool bEdgeCoveredInPreviousRuns = CovEdgesInPreviousRuns.find(edge_id) != CovEdgesInPreviousRuns.end();
+  if (bEdgeCoveredInPreviousRuns) return false; // edge covered already
+
+  if (getReachableSanitizerLocations(*destBB) > 0) return true; // edge not interesting/not covered/doesn't directly reach ubsan, but can reach some UBSAN violations
+
+  return false;
 }
 
 void Executor::branch(ExecutionState &state, 
@@ -950,16 +1056,22 @@ void Executor::branch(ExecutionState &state,
       for (unsigned i=0; i<N; ++i) {
         if (result[i] && !seedMap.count(result[i])) {
           if (CONCOLIC) {
-            uint64_t edge_id = getEdgeID(*result[i]);
-            const bool bEdgeInteresting = InterestingEdges.find(edge_id) != InterestingEdges.end();
-            if (bEdgeInteresting) {
+            BasicBlock* prevBB = result[i]->prevPC->inst->getParent();
+            BasicBlock* curBB = result[i]->pc->inst->getParent();
+            uint64_t edge_id = getEdgeID(prevBB, curBB);// *result[i]);
+            if (makesSenseToFlipEdge(prevBB, curBB)) {
                 //errs() << "writing test case for condition:" << conditions[i] << "\n";
-                errs() << "Solving interesting edge\n"; 
+                errs() << "1 - Solving interesting edge: " << edge_id << "\n"; 
                 addConstraint(*result[i], conditions[i]);
-                interpreterHandler->processTestCase(*result[i], 0, 0);
-                log_edge(edge_id);
+                if (interpreterHandler->processTestCase(*result[i], 0, 0)) {
+                  errs() << "1 - Solving edge " << edge_id << ": Success\n";
+                  logEdge(edge_id);
+                }
+                else
+                  errs() << "1 - Solving edge " << edge_id << ": Fail\n";
+
             }
-            else klee_message("Skip: edge %lu is not interesting", edge_id);
+            else klee_message("Skip: Won't try to flip edge %lu.", edge_id);
           }
           terminateState(*result[i]);
           result[i] = NULL;
@@ -1097,8 +1209,11 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
       if (CONCOLIC) {
         Instruction* prevInstr = current.prevPC->inst;
         BasicBlock* prevBB = prevInstr->getParent();
-        assert((prevInstr->getOpcode() == Instruction::Br) && "Should be after executing br?");
+
+        assert(prevInstr->getOpcode() == Instruction::Br);
         BranchInst *bi = cast<BranchInst>(prevInstr);
+        assert(bi->isConditional() && "Should be after executing br?");
+
 
         // Get the bb that 'could' be reached by flipping the edge
         // branch condition true -> pass execution to getSuccessor(0)
@@ -1106,17 +1221,21 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
         BasicBlock* reachableByFlipping = bi->getSuccessor(trueSeed?1:0); // flipped successor
         uint64_t edge_id = getEdgeID(prevBB, reachableByFlipping);
 
-        const bool bEdgeInteresting = InterestingEdges.find(edge_id) != InterestingEdges.end();
-        if (bEdgeInteresting) {
+        if (makesSenseToFlipEdge(prevBB, reachableByFlipping)) {
             //errs() << "writing test case for condition:" << conditions[i] << "\n";
-            errs() << "Solving interesting edge\n"; 
+            errs() << "2 - Solving interesting edge: " << edge_id << "\n"; 
             ExecutionState otherState(current);
             addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
-            interpreterHandler->processTestCase(otherState, 0, 0); // TODO: maybe create our own terminate function
+            if (interpreterHandler->processTestCase(otherState, 0, 0)) {
+              errs() << "2 - Solving edge " << edge_id << ": Success\n";
+              logEdge(edge_id);
+            }
+            else 
+              errs() << "2 - Solving edge " << edge_id << ": Fail\n";
+
             interpreterHandler->incPathsExplored(); // not sure this is correct
-            log_edge(edge_id); // TODO: check if solving was successful
         }
-        else klee_message("Skip-2: edge %lu is not interesting", edge_id);
+        else klee_message("Skip-2: Won't try to flip edge %lu.", edge_id);
       }
 
       res = trueSeed ? Solver::True : Solver::False;
@@ -2996,6 +3115,7 @@ void Executor::doDumpStates() {
   updateStates(nullptr);
 }
 
+
 void Executor::run(ExecutionState &initialState) {
   bindModuleConstants();
 
@@ -3034,6 +3154,8 @@ void Executor::run(ExecutionState &initialState) {
       executeInstruction(state, ki);
       processTimers(&state, maxInstructionTime * numSeeds);
       updateStates(&state);
+
+      logEdge(state);
 
       if ((stats::instructions % 1000) == 0) {
         int numSeeds = 0, numStates = 0;
@@ -3881,10 +4003,8 @@ void Executor::runFunctionAsMain(Function *f,
 				 char **envp) {
   std::vector<ref<Expr> > arguments;
 
-  for (const auto &eid : ParamInterestingEdges) {
-    klee_message("debug, interesting edge: %u\n", eid);
-    InterestingEdges.insert(eid);
-  }
+  readInterestingEdges();
+  readCovEdges();
 
   // force deterministic initialization of memory objects
   srand(1);

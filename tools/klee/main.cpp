@@ -335,7 +335,7 @@ public:
 
   void setInterpreter(Interpreter *i);
 
-  void processTestCase(const ExecutionState  &state,
+  bool processTestCase(const ExecutionState  &state,
                        const char *errorMessage,
                        const char *errorSuffix);
 
@@ -489,12 +489,13 @@ KleeHandler::openTestFile(const std::string &suffix, unsigned id) {
 
 
 /* Outputs all files (.ktest, .kquery, .cov etc.) describing a test case */
-void KleeHandler::processTestCase(const ExecutionState &state,
+bool KleeHandler::processTestCase(const ExecutionState &state,
                                   const char *errorMessage,
                                   const char *errorSuffix) {
+  bool success = false;
   if (!WriteNone) {
     std::vector< std::pair<std::string, std::vector<unsigned char> > > out;
-    bool success = m_interpreter->getSymbolicSolution(state, out);
+    success = m_interpreter->getSymbolicSolution(state, out);
 
     if (!success)
       klee_warning("unable to get symbolic solution, losing test case");
@@ -627,6 +628,8 @@ void KleeHandler::processTestCase(const ExecutionState &state,
     m_interpreter->prepareForEarlyExit();
     klee_error("EXITING ON ERROR:\n%s\n", errorMessage);
   }
+
+  return success;
 }
 
   // load a .path file
