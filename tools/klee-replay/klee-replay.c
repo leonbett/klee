@@ -490,6 +490,11 @@ void klee_mark_global(void *object) {
   ;
 }
 
+int klee_zest_enabled(void) {
+  return 0;
+}
+
+
 /*** HELPER FUNCTIONS ***/
 
 static void __emit_error(const char *msg) {

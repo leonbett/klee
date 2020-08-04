@@ -91,6 +91,9 @@
 using namespace llvm;
 using namespace klee;
 
+/* also used by the driver (tools/klee/main.cpp) */
+bool UseConcretePath = true;
+
 namespace klee {
 cl::OptionCategory DebugCat("Debugging options",
                             "These are debugging options.");

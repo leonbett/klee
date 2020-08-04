@@ -145,6 +145,8 @@ static SpecialFunctionHandler::HandlerInfo handlerInfo[] = {
   add("__ubsan_handle_mul_overflow", handleMulOverflow, false),
   add("__ubsan_handle_divrem_overflow", handleDivRemOverflow, false),
 
+  add("klee_zest_enabled", handleZestEnabled, true),
+
 #undef addDNR
 #undef add
 };
@@ -897,4 +899,16 @@ void SpecialFunctionHandler::handleDivRemOverflow(ExecutionState &state,
     klee_warning("overflow on division or remainder");
   else      
     executor.terminateStateOnError(state, "overflow on division or remainder", Executor::Overflow);
+}
+
+extern bool UseConcretePath;
+
+void SpecialFunctionHandler::handleZestEnabled(ExecutionState &state,
+                                            KInstruction *target,
+                                            std::vector<ref<Expr> > &arguments) {
+  // XXX should type check args
+  assert(arguments.size()==0 &&
+         "invalid number of arguments to klee_zest_enabled");
+  executor.bindLocal(target, state,
+                     ConstantExpr::create(UseConcretePath, Expr::Int32));
 }

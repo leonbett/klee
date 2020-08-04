@@ -160,6 +160,9 @@ extern "C" {
 
   /* Get errno value of the current state */
   int klee_get_errno(void);
+
+  int klee_zest_enabled(void);
+  
 #ifdef __cplusplus
 }
 #endif
