@@ -543,6 +543,9 @@ public:
       override;
 
   Expr::Width getWidthForLLVMType(llvm::Type *type) const;
+  
+  std::vector<unsigned char> readObjectAtAddress(ExecutionState &state, ref<Expr> addressExpr);
+
   size_t getAllocationAlignment(const llvm::Value *allocSite) const;
 
   /// Returns the errno location in memory of the state

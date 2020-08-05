@@ -478,7 +478,13 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
       interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
 
-  this->solver = new TimingSolver(solver, EqualitySubstitution);
+  //this->solver = new TimingSolver(solver, EqualitySubstitution);
+  if (!UseConcretePath) {
+    this->solver = new TimingSolver(solver, EqualitySubstitution);
+  } else {
+    this->solver = new TimingSolver(solver, EqualitySubstitution, &seedMap);
+  }
+
   memory = new MemoryManager(&arrayCache);
 
   initializeSearchOptions();
@@ -1350,7 +1356,9 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   }
 }
 
+unsigned constraintsAdded;
 void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
+  constraintsAdded++; // Leon: added
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(condition)) {
     if (!CE->isTrue())
       llvm::report_fatal_error("attempt to add invalid constraint");
@@ -1472,9 +1480,9 @@ void Executor::executeGetValue(ExecutionState &state,
   e = state.constraints.simplifyExpr(e);
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
     seedMap.find(&state);
-  if (it==seedMap.end() || isa<ConstantExpr>(e)) {
+  if (it==seedMap.end() || isa<ConstantExpr>(e) || UseConcretePath) {
     ref<ConstantExpr> value;
-    e = optimizer.optimizeExpr(e, true);
+    //e = optimizer.optimizeExpr(e, true); // Leon: this is not in zesti
     bool success = solver->getValue(state, e, value);
     assert(success && "FIXME: Unhandled solver failure");
     (void) success;
@@ -1483,10 +1491,11 @@ void Executor::executeGetValue(ExecutionState &state,
     std::set< ref<Expr> > values;
     for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
            siie = it->second.end(); siit != siie; ++siit) {
-      ref<Expr> cond = siit->assignment.evaluate(e);
-      cond = optimizer.optimizeExpr(cond, true);
+      //ref<Expr> cond = siit->assignment.evaluate(e); // Leon: this is not in zesti
+      //cond = optimizer.optimizeExpr(cond, true); // Leon: this is not in zesti
       ref<ConstantExpr> value;
-      bool success = solver->getValue(state, cond, value);
+      bool success = solver->getValue(state, siit->assignment.evaluate(e), value); // Leon: added
+      //bool success = solver->getValue(state, cond, value);
       assert(success && "FIXME: Unhandled solver failure");
       (void) success;
       values.insert(value);
@@ -2019,7 +2028,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> cond = eval(ki, 0, state).value;
     BasicBlock *bb = si->getParent();
 
-    cond = toUnique(state, cond);
+    ref<Expr> ocond; // Leon: added
+    if (UseConcretePath)
+      ocond = cond;
+
+    cond = toUnique(state, cond); // , false); // Leon:added false
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(cond)) {
       // Somewhat gross to create these all the time, but fine till we
       // switch to an internal rep.
@@ -2030,8 +2043,28 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 #else
       unsigned index = si->findCaseValue(ci).getSuccessorIndex();
 #endif
+
+      if (UseConcretePath) { // Leon: added.
+        if (index) { //not default
+          addConstraint(state, EqExpr::create(ocond, cond));
+        } else {
+          ref<Expr> isDefault = ConstantExpr::alloc(1, Expr::Bool);
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 1)      
+          for (SwitchInst::CaseIt i = si->case_begin(), e = si->case_end();
+               i != e; ++i) {
+            ref<Expr> value = evalConstant(i.getCaseValue());
+#else
+          for (unsigned i=1, cases = si->getNumCases(); i<cases; ++i) {
+            ref<Expr> value = evalConstant(si->getCaseValue(i));
+#endif
+            ref<Expr> match = EqExpr::create(ocond, value);
+            isDefault = AndExpr::create(isDefault, Expr::createIsZero(match));
+          }
+          addConstraint(state, isDefault);
+          }
+        }
       transferToBasicBlock(si->getSuccessor(index), si->getParent(), state);
-    } else {
+    } /*end if (constantexpr..); ifelseendif messes with parentheses*/ else {
       // Handle possible different branch targets
 
       // We have the following assumptions:
@@ -3630,11 +3663,18 @@ void Executor::executeAlloc(ExecutionState &state,
                             bool zeroMemory,
                             const ObjectState *reallocFrom,
                             size_t allocationAlignment) {
+  ref<Expr> osize; // Leon: added
+  if (UseConcretePath) // Leon: added
+    osize = size; // Leon: added
   size = toUnique(state, size);
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(size)) {
+    if (UseConcretePath && !dyn_cast<ConstantExpr>(osize)) { // Leon: we probably need this
+      addConstraint(state, EqExpr::create(osize, size));
+    }
+
     const llvm::Value *allocSite = state.prevPC->inst;
     if (allocationAlignment == 0) {
-      allocationAlignment = getAllocationAlignment(allocSite);
+      allocationAlignment = getAllocationAlignment(allocSite); 
     }
     MemoryObject *mo =
         memory->allocate(CE->getZExtValue(), isLocal, /*isGlobal=*/false,
@@ -3670,7 +3710,7 @@ void Executor::executeAlloc(ExecutionState &state,
     // return argument first). This shows up in pcre when llvm
     // collapses the size expression with a select.
 
-    size = optimizer.optimizeExpr(size, true);
+    // size = optimizer.optimizeExpr(size, true); // Leon: ZESTI doesn't have this
 
     ref<ConstantExpr> example;
     bool success = solver->getValue(state, size, example);
@@ -3814,7 +3854,8 @@ void Executor::executeMemoryOperation(ExecutionState &state,
       value = state.constraints.simplifyExpr(value);
   }
 
-  address = optimizer.optimizeExpr(address, true);
+  // address = optimizer.optimizeExpr(address, true); // Leon: ZESTI doesn't have this. This is maybe an optimization that we can include though.
+
 
   // fast path: single in-bounds resolution
   ObjectPair op;
@@ -3839,7 +3880,10 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
     bool inBounds;
     solver->setTimeout(coreSolverTimeout);
-    bool success = solver->mustBeTrue(state, check, inBounds);
+
+    bool useSeeds = true; // Leon: skip bound checks for now. // TODO review/cmp to zesti
+    bool success = solver->mustBeTrue(state, check, inBounds, useSeeds);
+
     solver->setTimeout(time::Span());
     if (!success) {
       state.pc = state.prevPC;
@@ -3923,11 +3967,48 @@ void Executor::executeMemoryOperation(ExecutionState &state,
   }
 }
 
+std::vector<unsigned char>
+Executor::readObjectAtAddress(ExecutionState &state, ref<Expr> addressExpr) { // Leon: copied from zesti
+		ObjectPair op;
+		addressExpr = toUnique(state, addressExpr);
+		ref<ConstantExpr> address = cast<ConstantExpr>(addressExpr);
+		if (!state.addressSpace.resolveOne(address, op))
+			assert(0 && "XXX out of bounds / multiple resolution unhandled");
+		bool res;
+		assert(solver->mustBeTrue(state, EqExpr::create(address, 
+					op.first->getBaseExpr()), res) &&
+					 res &&
+					 "XXX interior pointer unhandled");
+		const MemoryObject *mo = op.first;
+		const ObjectState *os = op.second;
+		
+		char buf;
+		std::vector<unsigned char> result;
+		unsigned i;
+		for (i = 0; i < mo->size; i++) {
+			ref<Expr> cur = os->read8(i);
+			cur = toUnique(state, cur);
+			assert(isa<ConstantExpr>(cur) && 
+						 "hit symbolic byte while reading concrete object");
+			buf = cast<ConstantExpr>(cur)->getZExtValue(8);
+			result.push_back(buf);
+		}
+		
+		return result;
+	}
+
 void Executor::executeMakeSymbolic(ExecutionState &state, 
                                    const MemoryObject *mo,
                                    const std::string &name) {
   // Create a new object state for the memory object (instead of a copy).
   if (!replayKTest) {
+    std::vector<unsigned char> prevVal;
+    if (UseConcretePath) { // Leon: We need this. 3 sites in this
+      prevVal = readObjectAtAddress(state,
+                                    ConstantExpr::create(mo->address,
+                                                         Context::get().getPointerWidth()));
+    }
+
     // Find a unique name for this array.  First try the original name,
     // or if that fails try adding a unique identifier.
     unsigned id = 0;
@@ -3946,6 +4027,9 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
              siie = it->second.end(); siit != siie; ++siit) {
         SeedInfo &si = *siit;
+        if (UseConcretePath) {
+			    si.assignment.bindings[array] = prevVal;
+		    } else {
         KTestObject *obj = si.getNextInput(mo, NamedSeedMatching);
 
         if (!obj) {
@@ -3982,7 +4066,10 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
         }
       }
     }
-  } else {
+  }else {
+
+	  }
+  } else { // end replay ktest
     ObjectState *os = bindObjectInState(state, mo, false);
     if (replayPosition >= replayKTest->numObjects) {
       terminateStateOnError(state, "replay count mismatch", User);
