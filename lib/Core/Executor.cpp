@@ -426,7 +426,7 @@ cl::opt<bool> DebugCheckForImpliedValues(
 
 bool CONCOLIC = true;
 bool UseConcretePath = true;
-
+bool CopyUnconstrainedBytesFromSeed = true;
 
 namespace klee {
   RNG theRNG;
@@ -3944,7 +3944,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       uniqueName = name + "_" + llvm::utostr(++id);
     }
     const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
-    bindObjectInState(state, mo, false, array);
+    ObjectState* os = bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
     
     std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
@@ -3980,8 +3980,20 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
             break;
           } else {
             std::vector<unsigned char> &values = si.assignment.bindings[array];
-            values.insert(values.begin(), obj->bytes, 
+            values.insert(values.begin(), obj->bytes,
                           obj->bytes + std::min(obj->numBytes, mo->size));
+
+            if (CopyUnconstrainedBytesFromSeed) {
+              assert(mo->size >= values.size() && "sanity check");
+              unsigned int offset=0;
+              for (unsigned char c: values) {
+                std::vector<ref<Expr>> preferences;
+                preferences.push_back(ConstantExpr::create(mo->address, Context::get().getPointerWidth()));
+                preferences.push_back(EqExpr::create(os->read8(offset++), ConstantExpr::create(c, Expr::Int8)) );  // assuming char is 8-bit
+                specialFunctionHandler->handlePreferCex(state, NULL, preferences);
+              }
+            }
+            
             if (ZeroSeedExtension) {
               for (unsigned i=obj->numBytes; i<mo->size; ++i)
                 values.push_back('\0');
@@ -4181,8 +4193,6 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
   // the preferred constraints.  See test/Features/PreferCex.c for
   // an example) While this process can be very expensive, it can
   // also make understanding individual test cases much easier.
-
-  // TODO: copy unconstrained bytes from seed to test cases
   for (unsigned i = 0; i != state.symbolics.size(); ++i) {
     const MemoryObject *mo = state.symbolics[i].first;
     std::vector< ref<Expr> >::const_iterator pi = 
