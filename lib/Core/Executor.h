@@ -346,6 +346,8 @@ private:
               const std::vector< ref<Expr> > &conditions,
               std::vector<ExecutionState*> &result);
 
+  void concolicFlip(ExecutionState &current, ref<Expr> condition, bool ConcreteTookTrueBranch);
+
   // Fork current and return states in which condition holds / does
   // not hold, respectively. One of the states is necessarily the
   // current state, and one of the states may be null.

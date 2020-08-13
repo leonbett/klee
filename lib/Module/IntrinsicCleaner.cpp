@@ -10,6 +10,8 @@
 #include "Passes.h"
 
 #include "klee/Config/Version.h"
+#include "klee/Common.h"
+
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -23,6 +25,8 @@
 #include "llvm/Pass.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+
+
 
 using namespace llvm;
 
@@ -50,6 +54,8 @@ bool IntrinsicCleanerPass::runOnBasicBlock(BasicBlock &b, Module &M) {
   unsigned WordSize = DataLayout.getPointerSizeInBits() / 8;
   for (BasicBlock::iterator i = b.begin(), ie = b.end(); i != ie;) {
     IntrinsicInst *ii = dyn_cast<IntrinsicInst>(&*i);
+    Instruction& inst  = *i;
+
     // increment now since deletion of instructions makes iterator invalid.
     ++i;
     if (ii) {
@@ -118,7 +124,6 @@ bool IntrinsicCleanerPass::runOnBasicBlock(BasicBlock &b, Module &M) {
 #else
         IRBuilder<> builder(ii->getParent(), ii);
 #endif
-
         Value *op1 = ii->getArgOperand(0);
         Value *op2 = ii->getArgOperand(1);
 
@@ -188,13 +193,30 @@ bool IntrinsicCleanerPass::runOnBasicBlock(BasicBlock &b, Module &M) {
         // if one desires the wrapping should write
         //     uint8_t = (uint8_t + uint8_t) & 0xFF;
         // before this, must check if it has side effects on other operations
-        result = builder.CreateTrunc(result_ext, op1->getType());
-        Value *resultStruct = builder.CreateInsertValue(
-            UndefValue::get(ii->getType()), result, 0);
+
+        // Leon: (1) Get BBID before replace
+        uint64_t bbid = getBBID(b);
+
+        // Leon: (2) Add BBID as metadata to synthesized instruction
+        if (Instruction *result_ext_withBBID = dyn_cast<Instruction>(result_ext)) {
+          auto meta_loc = MDNode::get(M.getContext(), ConstantAsMetadata::get(ConstantInt::get(IntegerType::getInt32Ty(M.getContext()), bbid)));
+          result_ext_withBBID->setMetadata("afl_cur_loc", meta_loc);
+          result = builder.CreateTrunc(cast<Value>(result_ext_withBBID), op1->getType());
+        }
+        else {
+          errs() << "Couldn't cast result_ext/bbid fail\n";
+          result = builder.CreateTrunc(cast<Value>(result_ext), op1->getType());
+        }
+
+        Value *resultStruct = builder.CreateInsertValue(UndefValue::get(ii->getType()), result, 0);
         resultStruct = builder.CreateInsertValue(resultStruct, overflow, 1);
 
-        ii->replaceAllUsesWith(resultStruct);
-        ii->eraseFromParent();
+        // Leon: The intrinsic is used in multiple locations/basic blocks, but we cannot use "replaceAllUsesWith", because we need to attach the respective bbid as metadata, so we use "ReplaceInstWithValue" multiple times.
+        // Leon: (3) Replace intrinsic in this BB
+        BasicBlock::iterator iitt(inst);
+        BasicBlock::InstListType &BIL = inst.getParent()->getInstList();
+        ReplaceInstWithValue(BIL, iitt, resultStruct);
+
         dirty = true;
         break;
       }
@@ -259,7 +281,7 @@ bool IntrinsicCleanerPass::runOnBasicBlock(BasicBlock &b, Module &M) {
         break;
       }
       default:
-        IL->LowerIntrinsicCall(ii);
+        IL->LowerIntrinsicCall(ii); // Leon: this inlines/implements the intrinsic call
         dirty = true;
         break;
       }

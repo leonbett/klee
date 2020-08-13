@@ -425,6 +425,8 @@ cl::opt<bool> DebugCheckForImpliedValues(
 } // namespace
 
 bool CONCOLIC = true;
+bool UseConcretePath = true;
+
 
 namespace klee {
   RNG theRNG;
@@ -475,7 +477,11 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
       interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
 
-  this->solver = new TimingSolver(solver, EqualitySubstitution);
+  if (!UseConcretePath) {
+    this->solver = new TimingSolver(solver, EqualitySubstitution);
+  } else {
+    this->solver = new TimingSolver(solver, EqualitySubstitution, &seedMap);
+  }
   memory = new MemoryManager(&arrayCache);
 
   initializeSearchOptions();
@@ -964,18 +970,21 @@ void logEdge(ExecutionState& state) {
   }
 }
 
+bool flipAllNonCoveredEdges = true;
 bool makesSenseToFlipEdge(BasicBlock* srcBB, BasicBlock* destBB) {
   uint64_t edge_id = getEdgeID(srcBB, destBB);
 
   const bool bEdgeInteresting = InterestingEdges.find(edge_id) != InterestingEdges.end();
   if (bEdgeInteresting) return true; // interesting edges are passed as parameter to KLEE
-  if (BBHasSanitizerEdge(*srcBB)) return true; // BB has edge that can directly reach UBSAN violation handler
 
   const bool bEdgeCoveredInThisRun = CovEdgesInThisRun.find(edge_id) != CovEdgesInThisRun.end();
   if (bEdgeCoveredInThisRun) return false; // edge covered already
   const bool bEdgeCoveredInPreviousRuns = CovEdgesInPreviousRuns.find(edge_id) != CovEdgesInPreviousRuns.end();
   if (bEdgeCoveredInPreviousRuns) return false; // edge covered already
 
+  if (flipAllNonCoveredEdges) return true;
+
+  if (BBHasSanitizerEdge(*srcBB)) return true; // BB has edge that can directly reach UBSAN violation handler
   if (getReachableSanitizerLocations(*destBB) > 0) return true; // edge not interesting/not covered/doesn't directly reach ubsan, but can reach some UBSAN violations
 
   return false;
@@ -984,6 +993,10 @@ bool makesSenseToFlipEdge(BasicBlock* srcBB, BasicBlock* destBB) {
 void Executor::branch(ExecutionState &state, 
                       const std::vector< ref<Expr> > &conditions,
                       std::vector<ExecutionState*> &result) {
+  
+  if (UseConcretePath) assert(false && "never reached 1\n");
+
+    
   TimerStatIncrementer timer(stats::forkTime);
   unsigned N = conditions.size();
   assert(N);
@@ -1055,24 +1068,6 @@ void Executor::branch(ExecutionState &state,
     if (OnlyReplaySeeds) {
       for (unsigned i=0; i<N; ++i) {
         if (result[i] && !seedMap.count(result[i])) {
-          if (CONCOLIC) {
-            BasicBlock* prevBB = result[i]->prevPC->inst->getParent();
-            BasicBlock* curBB = result[i]->pc->inst->getParent();
-            uint64_t edge_id = getEdgeID(prevBB, curBB);// *result[i]);
-            if (makesSenseToFlipEdge(prevBB, curBB)) {
-                //errs() << "writing test case for condition:" << conditions[i] << "\n";
-                errs() << "1 - Solving interesting edge: " << edge_id << "\n"; 
-                addConstraint(*result[i], conditions[i]);
-                if (interpreterHandler->processTestCase(*result[i], 0, 0)) {
-                  errs() << "1 - Solving edge " << edge_id << ": Success\n";
-                  logEdge(edge_id);
-                }
-                else
-                  errs() << "1 - Solving edge " << edge_id << ": Fail\n";
-
-            }
-            else klee_message("Skip: Won't try to flip edge %lu.", edge_id);
-          }
           terminateState(*result[i]);
           result[i] = NULL;
         }
@@ -1084,6 +1079,46 @@ void Executor::branch(ExecutionState &state,
     if (result[i])
       addConstraint(*result[i], conditions[i]);
 }
+
+uint64_t flipping_attempts = 0;
+void Executor::concolicFlip(ExecutionState &current, ref<Expr> condition, bool ConcreteTookTrueBranch) {
+  condition = current.constraints.simplifyExpr(condition); // Leon: This is to detect constant expressions early on, so ConstraintManager won't complain. Is this required?
+
+  if (!isa<ConstantExpr>(condition))  {
+    Instruction* prevInstr = current.prevPC->inst;
+    
+    assert(prevInstr->getOpcode() == Instruction::Br && "Should be br?");
+    BranchInst *bi = cast<BranchInst>(prevInstr);
+    BasicBlock* reachableByFlipping = bi->getSuccessor(ConcreteTookTrueBranch?1:0); // flipped successor
+    BasicBlock* prevBB = prevInstr->getParent();
+
+    uint64_t edge_id = getEdgeID(prevBB, reachableByFlipping);
+    errs() << "beforeMakesSenseToFlipEdge " << edge_id << "\n";
+
+    if (makesSenseToFlipEdge(prevBB, reachableByFlipping)) {
+      ExecutionState* concolicState = current.branch(); // =copy
+      if (ConcreteTookTrueBranch)
+        addConstraint(*concolicState, Expr::createIsZero(condition));
+      else
+        addConstraint(*concolicState, condition);
+
+      bool success = interpreterHandler->processTestCase(*concolicState, 0, 0);
+      if (success) logEdge(edge_id);
+
+      errs() << "Success: " << success << "\n";
+      errs() << "flipping attempts so far: " << ++flipping_attempts << "\n";
+    }
+  }
+
+  if (UseConcretePath) {
+    if (ConcreteTookTrueBranch)
+      addConstraint(current, condition);
+    else
+      addConstraint(current, Expr::createIsZero(condition));
+  }
+}
+
+
 
 Executor::StatePair 
 Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
@@ -1205,38 +1240,7 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
     if (!(trueSeed && falseSeed)) {
       assert(trueSeed || falseSeed);
 
-      /* test concolic: called for if-statements */
-      if (CONCOLIC) {
-        Instruction* prevInstr = current.prevPC->inst;
-        BasicBlock* prevBB = prevInstr->getParent();
-
-        assert(prevInstr->getOpcode() == Instruction::Br);
-        BranchInst *bi = cast<BranchInst>(prevInstr);
-        assert(bi->isConditional() && "Should be after executing br?");
-
-
-        // Get the bb that 'could' be reached by flipping the edge
-        // branch condition true -> pass execution to getSuccessor(0)
-        // branch condition false -> pass execution to getSuccessor(1)
-        BasicBlock* reachableByFlipping = bi->getSuccessor(trueSeed?1:0); // flipped successor
-        uint64_t edge_id = getEdgeID(prevBB, reachableByFlipping);
-
-        if (makesSenseToFlipEdge(prevBB, reachableByFlipping)) {
-            //errs() << "writing test case for condition:" << conditions[i] << "\n";
-            errs() << "2 - Solving interesting edge: " << edge_id << "\n"; 
-            ExecutionState otherState(current);
-            addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
-            if (interpreterHandler->processTestCase(otherState, 0, 0)) {
-              errs() << "2 - Solving edge " << edge_id << ": Success\n";
-              logEdge(edge_id);
-            }
-            else 
-              errs() << "2 - Solving edge " << edge_id << ": Fail\n";
-
-            interpreterHandler->incPathsExplored(); // not sure this is correct
-        }
-        else klee_message("Skip-2: Won't try to flip edge %lu.", edge_id);
-      }
+      if (UseConcretePath) assert(false && "never reached 2\n");
 
       res = trueSeed ? Solver::True : Solver::False;
       addConstraint(current, trueSeed ? condition : Expr::createIsZero(condition));
@@ -1251,20 +1255,26 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   // the value it has been fixed at, we should take this as a nice
   // hint to just use the single constraint instead of all the binary
   // search ones. If that makes sense.
+
+  // Leon: In ZESTI mode, the solving is concretized, so a branch is either taken or not; never both at the same time. So the concolic code has moved below.
   if (res==Solver::True) {
     if (!isInternal) {
       if (pathWriter) {
         current.pathOS << "1";
       }
     }
+    if (!isInternal) concolicFlip(current, condition, true);
 
     return StatePair(&current, 0);
+
   } else if (res==Solver::False) {
     if (!isInternal) {
       if (pathWriter) {
         current.pathOS << "0";
       }
     }
+
+    if (!isInternal) concolicFlip(current, condition, false);
 
     return StatePair(0, &current);
   } else {
@@ -3826,7 +3836,8 @@ void Executor::executeMemoryOperation(ExecutionState &state,
   if (success) {
     const MemoryObject *mo = op.first;
 
-    if (MaxSymArraySize && mo->size >= MaxSymArraySize) {
+    // if ((MaxSymArraySize && mo->size >= MaxSymArraySize) || UseConcretePath) { // Leon: uncomment to concretize addresses
+    if ((MaxSymArraySize && mo->size >= MaxSymArraySize)) {
       address = toConstant(state, address, "max-sym-array-size");
     }
     
