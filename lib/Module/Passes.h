@@ -193,6 +193,15 @@ public:
   OptNonePass() : llvm::ModulePass(ID) {}
   bool runOnModule(llvm::Module &M) override;
 };
+
+class AflIdAssignPass : public llvm::ModulePass {
+public:
+  static char ID;
+  AflIdAssignPass() : llvm::ModulePass(ID) {}
+  bool runOnModule(llvm::Module &M) override;
+};
 } // namespace klee
+
+
 
 #endif

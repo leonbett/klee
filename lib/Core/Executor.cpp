@@ -1085,6 +1085,7 @@ void Executor::branch(ExecutionState &state,
       addConstraint(*result[i], conditions[i]);
 }
 
+
 Executor::StatePair 
 Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   Solver::Validity res;
@@ -1206,11 +1207,15 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
       assert(trueSeed || falseSeed);
 
       /* test concolic: called for if-statements */
-      if (CONCOLIC) {
+      if (CONCOLIC && !isInternal) {
         Instruction* prevInstr = current.prevPC->inst;
         BasicBlock* prevBB = prevInstr->getParent();
 
-        assert(prevInstr->getOpcode() == Instruction::Br);
+        if (prevInstr->getOpcode() != Instruction::Br) {
+          errs() << "prevInstr: " << prevInstr->getOpcodeName() << "\n";
+          assert(prevInstr->getOpcode() == Instruction::Br);
+        }
+
         BranchInst *bi = cast<BranchInst>(prevInstr);
         assert(bi->isConditional() && "Should be after executing br?");
 
@@ -1225,6 +1230,7 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
             //errs() << "writing test case for condition:" << conditions[i] << "\n";
             errs() << "2 - Solving interesting edge: " << edge_id << "\n"; 
             ExecutionState otherState(current);
+
             addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
             if (interpreterHandler->processTestCase(otherState, 0, 0)) {
               errs() << "2 - Solving edge " << edge_id << ": Success\n";
@@ -4171,6 +4177,7 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
   // an example) While this process can be very expensive, it can
   // also make understanding individual test cases much easier.
 
+/*
   // TODO: copy unconstrained bytes from seed to test cases
   for (unsigned i = 0; i != state.symbolics.size(); ++i) {
     const MemoryObject *mo = state.symbolics[i].first;
@@ -4192,6 +4199,7 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
     }
     if (pi!=pie) break;
   }
+*/
 
   std::vector< std::vector<unsigned char> > values;
   std::vector<const Array*> objects;
