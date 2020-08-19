@@ -55,6 +55,9 @@ extern "C" {
 
   void  kTest_free(KTest *);
 
+  unsigned kTest_sizeFirstElem(KTest *bo);
+  unsigned char* kTest_bytesFirstElem(KTest *bo);
+
 #ifdef __cplusplus
 }
 #endif

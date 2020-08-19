@@ -4071,6 +4071,8 @@ void Executor::runFunctionAsMain(Function *f,
     }
 
     ExecutionState *state = new ExecutionState(kmodule->functionMap[f]);
+    // Assign seed to state (used for outputting test cases with correct size)
+    state->seed = oneSeed.front();
 
     if (pathWriter) 
       state->pathOS = pathWriter->open();

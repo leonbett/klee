@@ -516,10 +516,20 @@ bool KleeHandler::processTestCase(const ExecutionState &state,
       for (unsigned i=0; i<b.numObjects; i++) {
         KTestObject *o = &b.objects[i];
         o->name = const_cast<char*>(out[i].first.c_str());
-        o->numBytes = out[i].second.size();
-        o->bytes = new unsigned char[o->numBytes];
-        assert(o->bytes);
-        std::copy(out[i].second.begin(), out[i].second.end(), o->bytes);
+        if (i==0) {
+          // Generated test cases should have the same size as the seed, but the symbolic array has the size of the biggest seed in fork-server mode. So we set the test case size to the seed size, to avoid having test cases filled with padding at the end.
+          o->numBytes = kTest_sizeFirstElem(state.seed);
+          o->bytes = new unsigned char[o->numBytes];
+          assert(o->bytes);
+          assert(o->numBytes <= out[i].second.size() && "Seed size should always be <= symbolic array size");
+          std::copy(out[i].second.begin(), out[i].second.begin()+o->numBytes, o->bytes);
+        }
+        else {
+          o->numBytes = out[i].second.size();
+          o->bytes = new unsigned char[o->numBytes];
+          assert(o->bytes);
+          std::copy(out[i].second.begin(), out[i].second.end(), o->bytes);
+        }
       }
 
       if (!kTest_toFile(&b, getOutputFilename(getTestFilename("ktest", id)).c_str())) {

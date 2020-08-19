@@ -229,6 +229,18 @@ unsigned kTest_numBytes(KTest *bo) {
   return res;
 }
 
+unsigned kTest_sizeFirstElem(KTest *bo) {
+  if (bo->numObjects > 0)
+    return bo->objects[0].numBytes;
+  return 0;
+}
+
+unsigned char* kTest_bytesFirstElem(KTest *bo) {
+  if (bo->numObjects > 0)
+    return bo->objects[0].bytes;
+  return 0;
+}
+
 void kTest_free(KTest *bo) {
   unsigned i;
   for (i=0; i<bo->numArgs; i++)
