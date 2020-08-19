@@ -133,6 +133,11 @@ cl::opt<bool> EmitAllErrors(
              "(default=false, i.e. one per (error,instruction) pair)"),
     cl::cat(TestGenCat));
 
+cl::opt<bool> CopyUnconstrainedBytesFromSeed(
+    "copy-unconstrained-bytes-from-seed",
+    cl::init(false),
+    cl::desc("Copy unconstrained bytes from seed to test case. The way this is currently implemented is expensive. (default=false)"),
+    cl::cat(TestGenCat));
 
 /* Constraint solving options */
 
@@ -3941,7 +3946,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       uniqueName = name + "_" + llvm::utostr(++id);
     }
     const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
-    bindObjectInState(state, mo, false, array);
+    ObjectState* os = bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
     
     std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
@@ -3979,6 +3984,19 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
             std::vector<unsigned char> &values = si.assignment.bindings[array];
             values.insert(values.begin(), obj->bytes, 
                           obj->bytes + std::min(obj->numBytes, mo->size));
+
+            if (CopyUnconstrainedBytesFromSeed) {
+              // This feature invokes the solver many times, so it can be expensive. It makes sense to implement this cheaper.
+              assert(mo->size >= values.size() && "sanity check");
+              unsigned int offset=0;
+              for (unsigned char c: values) {
+                std::vector<ref<Expr>> preferences;
+                preferences.push_back(ConstantExpr::create(mo->address, Context::get().getPointerWidth()));
+                preferences.push_back(EqExpr::create(os->read8(offset++), ConstantExpr::create(c, Expr::Int8)) );
+                specialFunctionHandler->handlePreferCex(state, NULL, preferences);
+              }
+            }
+
             if (ZeroSeedExtension) {
               for (unsigned i=obj->numBytes; i<mo->size; ++i)
                 values.push_back('\0');
@@ -4189,37 +4207,35 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
 
   ExecutionState tmp(state);
 
-  // Go through each byte in every test case and attempt to restrict
-  // it to the constraints contained in cexPreferences.  (Note:
-  // usually this means trying to make it an ASCII character (0-127)
-  // and therefore human readable. It is also possible to customize
-  // the preferred constraints.  See test/Features/PreferCex.c for
-  // an example) While this process can be very expensive, it can
-  // also make understanding individual test cases much easier.
-
-/*
-  // TODO: copy unconstrained bytes from seed to test cases
-  for (unsigned i = 0; i != state.symbolics.size(); ++i) {
-    const MemoryObject *mo = state.symbolics[i].first;
-    std::vector< ref<Expr> >::const_iterator pi = 
-      mo->cexPreferences.begin(), pie = mo->cexPreferences.end();
-    for (; pi != pie; ++pi) {
-      bool mustBeTrue;
-      // Attempt to bound byte to constraints held in cexPreferences
-      bool success = solver->mustBeTrue(tmp, Expr::createIsZero(*pi), 
-					mustBeTrue);
-      // If it isn't possible to constrain this particular byte in the desired
-      // way (normally this would mean that the byte can't be constrained to
-      // be between 0 and 127 without making the entire constraint list UNSAT)
-      // then just continue on to the next byte.
-      if (!success) break;
-      // If the particular constraint operated on in this iteration through
-      // the loop isn't implied then add it to the list of constraints.
-      if (!mustBeTrue) tmp.addConstraint(*pi);
+  if (CopyUnconstrainedBytesFromSeed) {
+    // Go through each byte in every test case and attempt to restrict
+    // it to the constraints contained in cexPreferences.  (Note:
+    // usually this means trying to make it an ASCII character (0-127)
+    // and therefore human readable. It is also possible to customize
+    // the preferred constraints.  See test/Features/PreferCex.c for
+    // an example) While this process can be very expensive, it can
+    // also make understanding individual test cases much easier.
+    for (unsigned i = 0; i != state.symbolics.size(); ++i) {
+      const MemoryObject *mo = state.symbolics[i].first;
+      std::vector< ref<Expr> >::const_iterator pi = 
+        mo->cexPreferences.begin(), pie = mo->cexPreferences.end();
+      for (; pi != pie; ++pi) {
+        bool mustBeTrue;
+        // Attempt to bound byte to constraints held in cexPreferences
+        bool success = solver->mustBeTrue(tmp, Expr::createIsZero(*pi), 
+            mustBeTrue);
+        // If it isn't possible to constrain this particular byte in the desired
+        // way (normally this would mean that the byte can't be constrained to
+        // be between 0 and 127 without making the entire constraint list UNSAT)
+        // then just continue on to the next byte.
+        if (!success) break;
+        // If the particular constraint operated on in this iteration through
+        // the loop isn't implied then add it to the list of constraints.
+        if (!mustBeTrue) tmp.addConstraint(*pi);
+      }
+      if (pi!=pie) break;
     }
-    if (pi!=pie) break;
   }
-*/
 
   std::vector< std::vector<unsigned char> > values;
   std::vector<const Array*> objects;
