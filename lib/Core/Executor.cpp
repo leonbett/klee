@@ -476,7 +476,7 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
 
   this->solver = new TimingSolver(solver, EqualitySubstitution);
-  memory = new MemoryManager(&arrayCache);
+  //memory = new MemoryManager(&arrayCache);
 
   initializeSearchOptions();
 
@@ -570,7 +570,7 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
 }
 
 Executor::~Executor() {
-  delete memory;
+  //delete memory;
   delete externalDispatcher;
   delete processTree;
   delete specialFunctionHandler;
@@ -923,8 +923,8 @@ uint64_t getEdgeID(BasicBlock* srcBB, BasicBlock* destBB) {
   uint64_t bbid_src = getBBID(*srcBB);
   uint64_t bbid_dest = getBBID(*destBB);
   if (bbid_src && bbid_dest) {
-    // errs() << "bbid_src: " << bbid_src << "\n";
-    // errs() << "bbid_dest: " << bbid_dest << "\n";
+    errs() << "bbid_src: " << bbid_src << "\n";
+    errs() << "bbid_dest: " << bbid_dest << "\n";
     return (bbid_src >> 1) ^ bbid_dest;
   }
   return 0;
@@ -1129,6 +1129,8 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   if (!success) {
     current.pc = current.prevPC;
     terminateStateEarly(current, "Query timed out (fork).");
+    errs() << "Query timed out, terminating state, condition is:\n";
+    condition->dump();
     return StatePair(0, 0);
   }
 
@@ -3123,7 +3125,7 @@ void Executor::doDumpStates() {
 
 
 void Executor::run(ExecutionState &initialState) {
-  bindModuleConstants();
+  //bindModuleConstants();
 
   // Delay init till now so that ticks don't accrue during
   // optimization and such.
@@ -4012,107 +4014,123 @@ void Executor::runFunctionAsMain(Function *f,
   readInterestingEdges();
   readCovEdges();
 
-  // force deterministic initialization of memory objects
-  srand(1);
-  srandom(1);
-  
-  MemoryObject *argvMO = 0;
+  const std::vector<struct KTest *> allSeeds = *usingSeeds; // deepcopy
+  arrayCache = ArrayCache(); // reuse cache
 
-  // In order to make uclibc happy and be closer to what the system is
-  // doing we lay out the environments at the end of the argv array
-  // (both are terminated by a null). There is also a final terminating
-  // null that uclibc seems to expect, possibly the ELF header?
+  for (int seedno = 0; seedno < allSeeds.size(); seedno++) {
+    std::vector<struct KTest *> oneSeed;
+    oneSeed.push_back(allSeeds.at(seedno));
+    usingSeeds = &oneSeed;
+    errs() << "Using seed no " << seedno << " of size " << kTest_numBytes(allSeeds.at(seedno)) << "\n";
+    assert(seedMap.empty() && "seedmap not empty");
+    assert(states.empty() && "states not empty");
 
-  int envc;
-  for (envc=0; envp[envc]; ++envc) ;
+    memory = new MemoryManager(&arrayCache);
 
-  unsigned NumPtrBytes = Context::get().getPointerWidth() / 8;
-  KFunction *kf = kmodule->functionMap[f];
-  assert(kf);
-  Function::arg_iterator ai = f->arg_begin(), ae = f->arg_end();
-  if (ai!=ae) {
-    arguments.push_back(ConstantExpr::alloc(argc, Expr::Int32));
-    if (++ai!=ae) {
-      Instruction *first = &*(f->begin()->begin());
-      argvMO =
-          memory->allocate((argc + 1 + envc + 1 + 1) * NumPtrBytes,
-                           /*isLocal=*/false, /*isGlobal=*/true,
-                           /*allocSite=*/first, /*alignment=*/8);
+    std::vector<ref<Expr> > arguments;
+    // force deterministic initialization of memory objects
+    srand(1);
+    srandom(1);
+    
+    MemoryObject *argvMO = 0;
 
-      if (!argvMO)
-        klee_error("Could not allocate memory for function arguments");
+    // In order to make uclibc happy and be closer to what the system is
+    // doing we lay out the environments at the end of the argv array
+    // (both are terminated by a null). There is also a final terminating
+    // null that uclibc seems to expect, possibly the ELF header?
 
-      arguments.push_back(argvMO->getBaseExpr());
+    int envc;
+    for (envc=0; envp[envc]; ++envc) ;
 
+    unsigned NumPtrBytes = Context::get().getPointerWidth() / 8;
+    KFunction *kf = kmodule->functionMap[f];
+    assert(kf);
+    Function::arg_iterator ai = f->arg_begin(), ae = f->arg_end();
+    if (ai!=ae) {
+      arguments.push_back(ConstantExpr::alloc(argc, Expr::Int32));
       if (++ai!=ae) {
-        uint64_t envp_start = argvMO->address + (argc+1)*NumPtrBytes;
-        arguments.push_back(Expr::createPointer(envp_start));
+        Instruction *first = &*(f->begin()->begin());
+        argvMO =
+            memory->allocate((argc + 1 + envc + 1 + 1) * NumPtrBytes,
+                            /*isLocal=*/false, /*isGlobal=*/true,
+                            /*allocSite=*/first, /*alignment=*/8);
 
-        if (++ai!=ae)
-          klee_error("invalid main function (expect 0-3 arguments)");
-      }
-    }
-  }
-
-  ExecutionState *state = new ExecutionState(kmodule->functionMap[f]);
-  
-  if (pathWriter) 
-    state->pathOS = pathWriter->open();
-  if (symPathWriter) 
-    state->symPathOS = symPathWriter->open();
-
-
-  if (statsTracker)
-    statsTracker->framePushed(*state, 0);
-
-  assert(arguments.size() == f->arg_size() && "wrong number of arguments");
-  for (unsigned i = 0, e = f->arg_size(); i != e; ++i)
-    bindArgument(kf, i, *state, arguments[i]);
-
-  if (argvMO) {
-    ObjectState *argvOS = bindObjectInState(*state, argvMO, false);
-
-    for (int i=0; i<argc+1+envc+1+1; i++) {
-      if (i==argc || i>=argc+1+envc) {
-        // Write NULL pointer
-        argvOS->write(i * NumPtrBytes, Expr::createPointer(0));
-      } else {
-        char *s = i<argc ? argv[i] : envp[i-(argc+1)];
-        int j, len = strlen(s);
-
-        MemoryObject *arg =
-            memory->allocate(len + 1, /*isLocal=*/false, /*isGlobal=*/true,
-                             /*allocSite=*/state->pc->inst, /*alignment=*/8);
-        if (!arg)
+        if (!argvMO)
           klee_error("Could not allocate memory for function arguments");
-        ObjectState *os = bindObjectInState(*state, arg, false);
-        for (j=0; j<len+1; j++)
-          os->write8(j, s[j]);
 
-        // Write pointer to newly allocated and initialised argv/envp c-string
-        argvOS->write(i * NumPtrBytes, arg->getBaseExpr());
+        arguments.push_back(argvMO->getBaseExpr());
+
+        if (++ai!=ae) {
+          uint64_t envp_start = argvMO->address + (argc+1)*NumPtrBytes;
+          arguments.push_back(Expr::createPointer(envp_start));
+
+          if (++ai!=ae)
+            klee_error("invalid main function (expect 0-3 arguments)");
+        }
       }
     }
+
+    ExecutionState *state = new ExecutionState(kmodule->functionMap[f]);
+
+    if (pathWriter) 
+      state->pathOS = pathWriter->open();
+    if (symPathWriter) 
+      state->symPathOS = symPathWriter->open();
+
+
+    if (statsTracker)
+      statsTracker->framePushed(*state, 0);
+
+    assert(arguments.size() == f->arg_size() && "wrong number of arguments");
+    for (unsigned i = 0, e = f->arg_size(); i != e; ++i)
+      bindArgument(kf, i, *state, arguments[i]);
+
+    if (argvMO) {
+      ObjectState *argvOS = bindObjectInState(*state, argvMO, false);
+
+      for (int i=0; i<argc+1+envc+1+1; i++) {
+        if (i==argc || i>=argc+1+envc) {
+          // Write NULL pointer
+          argvOS->write(i * NumPtrBytes, Expr::createPointer(0));
+        } else {
+          char *s = i<argc ? argv[i] : envp[i-(argc+1)];
+          int j, len = strlen(s);
+
+          MemoryObject *arg =
+              memory->allocate(len + 1, /*isLocal=*/false, /*isGlobal=*/true,
+                              /*allocSite=*/state->pc->inst, /*alignment=*/8);
+          if (!arg)
+            klee_error("Could not allocate memory for function arguments");
+          ObjectState *os = bindObjectInState(*state, arg, false);
+          for (j=0; j<len+1; j++)
+            os->write8(j, s[j]);
+
+          // Write pointer to newly allocated and initialised argv/envp c-string
+          argvOS->write(i * NumPtrBytes, arg->getBaseExpr());
+        }
+      }
+    }
+    
+    initializeGlobals(*state);
+
+    processTree = new PTree(state);
+    state->ptreeNode = processTree->root;
+    if (seedno==0) bindModuleConstants();
+    run(*state);
+    delete processTree;
+    processTree = 0;
+
+    // hack to clear memory objects
+    delete memory;
+    //memory = new MemoryManager(NULL);
+
+    globalObjects.clear();
+    globalAddresses.clear();
+
+    if (statsTracker)
+      statsTracker->done();
+
   }
-  
-  initializeGlobals(*state);
-
-  processTree = new PTree(state);
-  state->ptreeNode = processTree->root;
-  run(*state);
-  delete processTree;
-  processTree = 0;
-
-  // hack to clear memory objects
-  delete memory;
-  memory = new MemoryManager(NULL);
-
-  globalObjects.clear();
-  globalAddresses.clear();
-
-  if (statsTracker)
-    statsTracker->done();
-
   serializeCovEdges();
 }
 
