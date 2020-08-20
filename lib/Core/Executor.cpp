@@ -847,10 +847,10 @@ void serializeCovEdges() {
     errs() << "Warning: Could not open covered edges file for outputting: " << CoveredEdgesFile_out << "\n";
     return;
   }
-
-  errs() << "Dumping CovEdges\n";
+  
+  if (DEBUG) errs() << "Dumping CovEdges\n";
   for (const auto& it: CovEdgesInThisRun) {
-    errs() << it << ",1\n";
+    if (DEBUG) errs() << it << ",1\n";
     f << it << ",1\n";
   }
   f.close();
@@ -864,14 +864,14 @@ void readCovEdges() {
     return;
   }
 
-  errs() << "Reading covered edges\n";
+  if (DEBUG) errs() << "Reading covered edges\n";
   uint64_t edge_id;
   uint8_t hit_count;
   char delimiter;
   while ((f >> edge_id >> delimiter >> hit_count) && (delimiter == ',')) {
     //PreviouslyCovEdges[edge_id] = hit_count;
     CovEdgesInPreviousRuns.insert(edge_id); // ignoring hit_count for now.
-    errs() << "covered: " << edge_id << ", " << hit_count << "\n";
+    if (DEBUG) errs() << "covered: " << edge_id << ", " << hit_count << "\n";
 
   }
   f.close();
@@ -885,12 +885,12 @@ void readInterestingEdges() {
     errs() << "Warning: Could not open interesting-edges-file: " << InterestingEdgesFile << "\n";
     return;
   }
-  errs() << "Reading interesting edges\n";
+  if (DEBUG) errs() << "Reading interesting edges\n";
   uint64_t edge_id;
   char delimiter;
   while (f >> edge_id) {
     InterestingEdges.insert(edge_id);
-    errs() << "interesting: " << edge_id << "\n";
+    if (DEBUG) errs() << "interesting: " << edge_id << "\n";
   }
   f.close();
 }
