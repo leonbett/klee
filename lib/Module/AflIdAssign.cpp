@@ -31,23 +31,26 @@ static inline bool has_bbid_instrumentation(llvm::BasicBlock &bb){
 bool AflIdAssignPass::runOnModule(llvm::Module &M) {
   llvm::LLVMContext &C = M.getContext();
   llvm::IntegerType *Int32Ty = llvm::IntegerType::getInt32Ty(C);
+  unsigned int n = 0;
 
   for (auto &F : M) {
     for (auto &BB : F) {
       if (!has_bbid_instrumentation(BB)) {
         for (llvm::Instruction& instr : BB.getInstList()) {
-          //if (!is_llvm_dbg_intrinsic(instr)) { // they should be inlined at this point?
+            // Label the first instruction
             unsigned int loc = rand();
-            llvm::errs() << "AflIdAssignPass loc: " << loc << "\n";
+            //llvm::errs() << "AflIdAssignPass loc: " << loc << "\n";
             llvm::ConstantInt *CurLoc = llvm::ConstantInt::get(Int32Ty, loc);
             auto meta_loc = llvm::MDNode::get(C, llvm::ConstantAsMetadata::get(CurLoc));
             instr.setMetadata("afl_cur_loc", meta_loc);
+            n++;
             break;
-          //}
         }
       }
     }
   }
+
+  llvm::errs() << "AflIdAssignPass instrumented " << n << " BBs.\n";
   return true;
 }
 

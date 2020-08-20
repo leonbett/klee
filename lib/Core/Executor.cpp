@@ -430,6 +430,7 @@ cl::opt<bool> DebugCheckForImpliedValues(
 } // namespace
 
 bool CONCOLIC = true;
+bool DEBUG = false;
 
 namespace klee {
   RNG theRNG;
@@ -914,7 +915,7 @@ uint64_t getReachableSanitizerLocations(BasicBlock& bb) {
 // If a BB has the "afl_edge_sanitizer metadata, then it has an edge that directly reaches UBSAN violation handler code."
 bool BBHasSanitizerEdge(BasicBlock& bb) {
   for (Instruction& instr : bb) {
-    if (instr.getMetadata("afl_edge_sanitizer") != nullptr) return true; // hasMetadata()
+    if (instr.getMetadata("afl_edge_sanitizer") != nullptr) return true;
   }
   return false;
 }
@@ -928,26 +929,17 @@ uint64_t getEdgeID(BasicBlock* srcBB, BasicBlock* destBB) {
   uint64_t bbid_src = getBBID(*srcBB);
   uint64_t bbid_dest = getBBID(*destBB);
   if (bbid_src && bbid_dest) {
-    errs() << "bbid_src: " << bbid_src << "\n";
-    errs() << "bbid_dest: " << bbid_dest << "\n";
+    if (DEBUG) {
+      errs() << "bbid_src: " << bbid_src << "\n";
+      errs() << "bbid_dest: " << bbid_dest << "\n";
+    }
     return (bbid_src >> 1) ^ bbid_dest;
   }
   return 0;
 }
 
-/*
-uint64_t getEdgeID(ExecutionState& state) {
-  Instruction* prevInstr = state.prevPC->inst;
-	Instruction* curInstr = state.pc->inst;
-  BasicBlock* prevBB = prevInstr->getParent();
-	BasicBlock* curBB = curInstr->getParent();
-  assert((prevInstr->getOpcode() == Instruction::Br || prevInstr->getOpcode() == Instruction::Switch)  && "should always be br/switch/?"); // todo check if conditional br
-  return getEdgeID(prevBB, curBB);
-}
-*/
-
 void logEdge(uint64_t edge_id) {
-  errs() << "log edgeid: " << edge_id << "\n";
+  if (DEBUG) errs() << "log edgeid: " << edge_id << "\n";
   CovEdgesInThisRun.insert(edge_id);
   //CurrentlyCovEdges[edge_id]++;
 }
@@ -1063,9 +1055,8 @@ void Executor::branch(ExecutionState &state,
           if (CONCOLIC) {
             BasicBlock* prevBB = result[i]->prevPC->inst->getParent();
             BasicBlock* curBB = result[i]->pc->inst->getParent();
-            uint64_t edge_id = getEdgeID(prevBB, curBB);// *result[i]);
+            uint64_t edge_id = getEdgeID(prevBB, curBB);
             if (makesSenseToFlipEdge(prevBB, curBB)) {
-                //errs() << "writing test case for condition:" << conditions[i] << "\n";
                 errs() << "1 - Solving interesting edge: " << edge_id << "\n"; 
                 addConstraint(*result[i], conditions[i]);
                 if (interpreterHandler->processTestCase(*result[i], 0, 0)) {
@@ -1076,7 +1067,7 @@ void Executor::branch(ExecutionState &state,
                   errs() << "1 - Solving edge " << edge_id << ": Fail\n";
 
             }
-            else klee_message("Skip: Won't try to flip edge %lu.", edge_id);
+            else if (DEBUG) klee_message("Skip: Won't try to flip edge %lu.", edge_id);
           }
           terminateState(*result[i]);
           result[i] = NULL;
@@ -1234,7 +1225,6 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
         uint64_t edge_id = getEdgeID(prevBB, reachableByFlipping);
 
         if (makesSenseToFlipEdge(prevBB, reachableByFlipping)) {
-            //errs() << "writing test case for condition:" << conditions[i] << "\n";
             errs() << "2 - Solving interesting edge: " << edge_id << "\n"; 
             ExecutionState otherState(current);
 
@@ -1248,7 +1238,7 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
 
             interpreterHandler->incPathsExplored(); // not sure this is correct
         }
-        else klee_message("Skip-2: Won't try to flip edge %lu.", edge_id);
+        else if (DEBUG) klee_message("Skip-2: Won't try to flip edge %lu.", edge_id);
       }
 
       res = trueSeed ? Solver::True : Solver::False;
@@ -3170,7 +3160,7 @@ void Executor::run(ExecutionState &initialState) {
 
       logEdge(state);
 
-      if ((stats::instructions % 1000) == 0) {
+      if ((stats::instructions % 5) == 0) { // Enforce time out // 1000) == 0) {
         int numSeeds = 0, numStates = 0;
         for (std::map<ExecutionState*, std::vector<SeedInfo> >::iterator
                it = seedMap.begin(), ie = seedMap.end();
