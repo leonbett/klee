@@ -133,6 +133,11 @@ cl::opt<bool> EmitAllErrors(
              "(default=false, i.e. one per (error,instruction) pair)"),
     cl::cat(TestGenCat));
 
+cl::opt<bool> CopyUnconstrainedBytesFromSeed(
+    "copy-unconstrained-bytes-from-seed",
+    cl::init(false),
+    cl::desc("Copy unconstrained bytes from seed to test case. The way this is currently implemented is expensive. (default=false)"),
+    cl::cat(TestGenCat));
 
 /* Constraint solving options */
 
@@ -252,6 +257,24 @@ cl::opt<std::string>
                       "search (default=0s (off))"),
              cl::cat(SeedingCat));
 
+cl::opt<std::string>
+    InterestingEdgesFile("interesting-edges-file",
+              cl::desc("File containing a list of interesting edge id's, "
+                        "which concolic execution will try to solve."),
+              cl::cat(SeedingCat));
+
+ cl::opt<std::string>
+    CoveredEdgesFile_in("cov-edges-in-file",
+              cl::desc("File containing a list of edge ids, "
+                        "and a counter expressing how often "
+                        "they have been hit by a single input. "),
+              cl::cat(SeedingCat));
+
+ cl::opt<std::string>
+    CoveredEdgesFile_out("cov-edges-out-file",
+              cl::desc("Write covered edges and hit count "
+                        "to this file."),
+              cl::cat(SeedingCat));
 
 /*** Termination criteria options ***/
 
@@ -406,6 +429,9 @@ cl::opt<bool> DebugCheckForImpliedValues(
 
 } // namespace
 
+bool CONCOLIC = true;
+bool DEBUG = false;
+
 namespace klee {
   RNG theRNG;
 }
@@ -456,7 +482,7 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
 
   this->solver = new TimingSolver(solver, EqualitySubstitution);
-  memory = new MemoryManager(&arrayCache);
+  //memory = new MemoryManager(&arrayCache);
 
   initializeSearchOptions();
 
@@ -550,7 +576,7 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
 }
 
 Executor::~Executor() {
-  delete memory;
+  //delete memory;
   delete externalDispatcher;
   delete processTree;
   delete specialFunctionHandler;
@@ -626,6 +652,8 @@ MemoryObject * Executor::addExternalObject(ExecutionState &state,
     os->setReadOnly(true);  
   return mo;
 }
+
+
 
 
 extern void *__dso_handle __attribute__ ((__weak__));
@@ -804,6 +832,152 @@ void Executor::initializeGlobals(ExecutionState &state) {
   }
 }
 
+std::set<uint64_t> CovEdges;
+std::set<uint64_t> InterestingEdges;
+std::set<uint64_t> CovEdgesInPreviousRuns;
+std::set<uint64_t> CovEdgesInThisRun;
+//std::unordered_map<uint64_t, uint8_t> PreviouslyCovEdges;
+//std::unordered_map<uint64_t, uint64_t> CurrentlyCovEdges;
+
+
+void serializeCovEdges() {
+  std::ofstream f;
+  f.open(CoveredEdgesFile_out);
+  if (!f) {
+    errs() << "Warning: Could not open covered edges file for outputting: " << CoveredEdgesFile_out << "\n";
+    return;
+  }
+  
+  if (DEBUG) errs() << "Dumping CovEdges\n";
+  for (const auto& it: CovEdgesInThisRun) {
+    if (DEBUG) errs() << it << ",1\n";
+    f << it << ",1\n";
+  }
+  f.close();
+}
+
+void readCovEdges() {
+  std::ifstream f;
+  f.open(CoveredEdgesFile_in); // other file name?
+  if (!f) {
+    errs() << "Warning: Could not open covered edges file: " << CoveredEdgesFile_in << "\n";
+    return;
+  }
+
+  if (DEBUG) errs() << "Reading covered edges\n";
+  uint64_t edge_id;
+  uint8_t hit_count;
+  char delimiter;
+  while ((f >> edge_id >> delimiter >> hit_count) && (delimiter == ',')) {
+    //PreviouslyCovEdges[edge_id] = hit_count;
+    CovEdgesInPreviousRuns.insert(edge_id); // ignoring hit_count for now.
+    if (DEBUG) errs() << "covered: " << edge_id << ", " << hit_count << "\n";
+
+  }
+  f.close();
+}
+
+//Format: "({64bit-edge id}\n)*"
+void readInterestingEdges() {
+  std::ifstream f;
+  f.open(InterestingEdgesFile);
+  if (!f) {
+    errs() << "Warning: Could not open interesting-edges-file: " << InterestingEdgesFile << "\n";
+    return;
+  }
+  if (DEBUG) errs() << "Reading interesting edges\n";
+  uint64_t edge_id;
+  char delimiter;
+  while (f >> edge_id) {
+    InterestingEdges.insert(edge_id);
+    if (DEBUG) errs() << "interesting: " << edge_id << "\n";
+  }
+  f.close();
+}
+
+uint64_t getMetadata(BasicBlock& bb, StringRef name) {
+  for (Instruction& instr : bb) {
+    MDNode* md = instr.getMetadata(name);
+    if (md) return mdconst::dyn_extract<ConstantInt>(md->getOperand(0))->getZExtValue();
+  }
+  // errs() << "afl_cur_loc not found\n"; // e.g., library
+  return 0;
+}
+
+uint64_t getBBID(BasicBlock& bb) {
+  return getMetadata(bb, "afl_cur_loc");
+}
+
+uint64_t getReachableSanitizerLocations(BasicBlock& bb) {
+  return getMetadata(bb, "savior_bug_num");
+}
+
+// If a BB has the "afl_edge_sanitizer metadata, then it has an edge that directly reaches UBSAN violation handler code."
+bool BBHasSanitizerEdge(BasicBlock& bb) {
+  for (Instruction& instr : bb) {
+    if (instr.getMetadata("afl_edge_sanitizer") != nullptr) return true;
+  }
+  return false;
+}
+
+uint64_t getReachableSanitizerLocations(ExecutionState& state) {
+  BasicBlock* bb = state.pc->inst->getParent();
+  return getReachableSanitizerLocations(*bb);
+}
+
+uint64_t getEdgeID(BasicBlock* srcBB, BasicBlock* destBB) {
+  uint64_t bbid_src = getBBID(*srcBB);
+  uint64_t bbid_dest = getBBID(*destBB);
+  if (bbid_src && bbid_dest) {
+    if (DEBUG) {
+      errs() << "bbid_src: " << bbid_src << "\n";
+      errs() << "bbid_dest: " << bbid_dest << "\n";
+    }
+    return (bbid_src >> 1) ^ bbid_dest;
+  }
+  return 0;
+}
+
+void logEdge(uint64_t edge_id) {
+  if (DEBUG) errs() << "log edgeid: " << edge_id << "\n";
+  CovEdgesInThisRun.insert(edge_id);
+  //CurrentlyCovEdges[edge_id]++;
+}
+
+
+// We're only interested in edges from conditional branch or switch instructions.
+void logEdge(ExecutionState& state) {
+  Instruction *prevInstr, *curInstr;
+  if (state.pc && (curInstr=state.pc->inst) && state.prevPC && (prevInstr=state.prevPC->inst)) {
+    bool bConditionalBranch = false;
+    if (prevInstr->getOpcode() == Instruction::Br) {
+      BranchInst *bi = cast<BranchInst>(prevInstr);
+      bConditionalBranch = bi->isConditional();
+    }
+    if (bConditionalBranch || prevInstr->getOpcode() == Instruction::Switch) {
+      uint64_t edge_id = getEdgeID(prevInstr->getParent(), curInstr->getParent());
+      logEdge(edge_id);
+    }
+  }
+}
+
+bool makesSenseToFlipEdge(BasicBlock* srcBB, BasicBlock* destBB) {
+  uint64_t edge_id = getEdgeID(srcBB, destBB);
+
+  const bool bEdgeInteresting = InterestingEdges.find(edge_id) != InterestingEdges.end();
+  if (bEdgeInteresting) return true; // interesting edges are passed as parameter to KLEE
+  if (BBHasSanitizerEdge(*srcBB)) return true; // BB has edge that can directly reach UBSAN violation handler
+
+  const bool bEdgeCoveredInThisRun = CovEdgesInThisRun.find(edge_id) != CovEdgesInThisRun.end();
+  if (bEdgeCoveredInThisRun) return false; // edge covered already
+  const bool bEdgeCoveredInPreviousRuns = CovEdgesInPreviousRuns.find(edge_id) != CovEdgesInPreviousRuns.end();
+  if (bEdgeCoveredInPreviousRuns) return false; // edge covered already
+
+  if (getReachableSanitizerLocations(*destBB) > 0) return true; // edge not interesting/not covered/doesn't directly reach ubsan, but can reach some UBSAN violations
+
+  return false;
+}
+
 void Executor::branch(ExecutionState &state, 
                       const std::vector< ref<Expr> > &conditions,
                       std::vector<ExecutionState*> &result) {
@@ -878,6 +1052,23 @@ void Executor::branch(ExecutionState &state,
     if (OnlyReplaySeeds) {
       for (unsigned i=0; i<N; ++i) {
         if (result[i] && !seedMap.count(result[i])) {
+          if (CONCOLIC) {
+            BasicBlock* prevBB = result[i]->prevPC->inst->getParent();
+            BasicBlock* curBB = result[i]->pc->inst->getParent();
+            uint64_t edge_id = getEdgeID(prevBB, curBB);
+            if (makesSenseToFlipEdge(prevBB, curBB)) {
+                errs() << "1 - Solving interesting edge: " << edge_id << "\n"; 
+                addConstraint(*result[i], conditions[i]);
+                if (interpreterHandler->processTestCase(*result[i], 0, 0)) {
+                  errs() << "1 - Solving edge " << edge_id << ": Success\n";
+                  logEdge(edge_id);
+                }
+                else
+                  errs() << "1 - Solving edge " << edge_id << ": Fail\n";
+
+            }
+            else if (DEBUG) klee_message("Skip: Won't try to flip edge %lu.", edge_id);
+          }
           terminateState(*result[i]);
           result[i] = NULL;
         }
@@ -889,6 +1080,7 @@ void Executor::branch(ExecutionState &state,
     if (result[i])
       addConstraint(*result[i], conditions[i]);
 }
+
 
 Executor::StatePair 
 Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
@@ -933,6 +1125,8 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   if (!success) {
     current.pc = current.prevPC;
     terminateStateEarly(current, "Query timed out (fork).");
+    errs() << "Query timed out, terminating state, condition is:\n";
+    condition->dump();
     return StatePair(0, 0);
   }
 
@@ -1009,7 +1203,44 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
     }
     if (!(trueSeed && falseSeed)) {
       assert(trueSeed || falseSeed);
-      
+
+      /* test concolic: called for if-statements */
+      if (CONCOLIC && !isInternal) {
+        Instruction* prevInstr = current.prevPC->inst;
+        BasicBlock* prevBB = prevInstr->getParent();
+
+        if (prevInstr->getOpcode() != Instruction::Br) {
+          errs() << "prevInstr: " << prevInstr->getOpcodeName() << "\n";
+          assert(prevInstr->getOpcode() == Instruction::Br);
+        }
+
+        BranchInst *bi = cast<BranchInst>(prevInstr);
+        assert(bi->isConditional() && "Should be after executing br?");
+
+
+        // Get the bb that 'could' be reached by flipping the edge
+        // branch condition true -> pass execution to getSuccessor(0)
+        // branch condition false -> pass execution to getSuccessor(1)
+        BasicBlock* reachableByFlipping = bi->getSuccessor(trueSeed?1:0); // flipped successor
+        uint64_t edge_id = getEdgeID(prevBB, reachableByFlipping);
+
+        if (makesSenseToFlipEdge(prevBB, reachableByFlipping)) {
+            errs() << "2 - Solving interesting edge: " << edge_id << "\n"; 
+            ExecutionState otherState(current);
+
+            addConstraint(otherState, trueSeed ? Expr::createIsZero(condition) : condition);
+            if (interpreterHandler->processTestCase(otherState, 0, 0)) {
+              errs() << "2 - Solving edge " << edge_id << ": Success\n";
+              logEdge(edge_id);
+            }
+            else 
+              errs() << "2 - Solving edge " << edge_id << ": Fail\n";
+
+            interpreterHandler->incPathsExplored(); // not sure this is correct
+        }
+        else if (DEBUG) klee_message("Skip-2: Won't try to flip edge %lu.", edge_id);
+      }
+
       res = trueSeed ? Solver::True : Solver::False;
       addConstraint(current, trueSeed ? condition : Expr::createIsZero(condition));
     }
@@ -2887,8 +3118,9 @@ void Executor::doDumpStates() {
   updateStates(nullptr);
 }
 
+
 void Executor::run(ExecutionState &initialState) {
-  bindModuleConstants();
+  //bindModuleConstants();
 
   // Delay init till now so that ticks don't accrue during
   // optimization and such.
@@ -2926,7 +3158,9 @@ void Executor::run(ExecutionState &initialState) {
       processTimers(&state, maxInstructionTime * numSeeds);
       updateStates(&state);
 
-      if ((stats::instructions % 1000) == 0) {
+      logEdge(state);
+
+      if ((stats::instructions % 5) == 0) { // Enforce time out // 1000) == 0) {
         int numSeeds = 0, numStates = 0;
         for (std::map<ExecutionState*, std::vector<SeedInfo> >::iterator
                it = seedMap.begin(), ie = seedMap.end();
@@ -3455,7 +3689,6 @@ void Executor::executeAlloc(ExecutionState &state,
         break;
       example = tmp;
     }
-
     StatePair fixedSize = fork(state, EqExpr::create(example, size), true);
     
     if (fixedSize.second) { 
@@ -3549,7 +3782,6 @@ void Executor::resolveExact(ExecutionState &state,
   for (ResolutionList::iterator it = rl.begin(), ie = rl.end(); 
        it != ie; ++it) {
     ref<Expr> inBounds = EqExpr::create(p, it->first->getBaseExpr());
-    
     StatePair branches = fork(*unbound, inBounds, true);
     
     if (branches.first)
@@ -3704,7 +3936,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       uniqueName = name + "_" + llvm::utostr(++id);
     }
     const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
-    bindObjectInState(state, mo, false, array);
+    ObjectState* os = bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
     
     std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
@@ -3742,6 +3974,19 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
             std::vector<unsigned char> &values = si.assignment.bindings[array];
             values.insert(values.begin(), obj->bytes, 
                           obj->bytes + std::min(obj->numBytes, mo->size));
+
+            if (CopyUnconstrainedBytesFromSeed) {
+              // This feature invokes the solver many times, so it can be expensive. It makes sense to implement this cheaper.
+              assert(mo->size >= values.size() && "sanity check");
+              unsigned int offset=0;
+              for (unsigned char c: values) {
+                std::vector<ref<Expr>> preferences;
+                preferences.push_back(ConstantExpr::create(mo->address, Context::get().getPointerWidth()));
+                preferences.push_back(EqExpr::create(os->read8(offset++), ConstantExpr::create(c, Expr::Int8)) );
+                specialFunctionHandler->handlePreferCex(state, NULL, preferences);
+              }
+            }
+
             if (ZeroSeedExtension) {
               for (unsigned i=obj->numBytes; i<mo->size; ++i)
                 values.push_back('\0');
@@ -3774,106 +4019,129 @@ void Executor::runFunctionAsMain(Function *f,
 				 char **envp) {
   std::vector<ref<Expr> > arguments;
 
-  // force deterministic initialization of memory objects
-  srand(1);
-  srandom(1);
-  
-  MemoryObject *argvMO = 0;
+  readInterestingEdges();
+  readCovEdges();
 
-  // In order to make uclibc happy and be closer to what the system is
-  // doing we lay out the environments at the end of the argv array
-  // (both are terminated by a null). There is also a final terminating
-  // null that uclibc seems to expect, possibly the ELF header?
+  const std::vector<struct KTest *> allSeeds = *usingSeeds; // deepcopy
+  arrayCache = ArrayCache(); // reuse cache
 
-  int envc;
-  for (envc=0; envp[envc]; ++envc) ;
+  for (int seedno = 0; seedno < allSeeds.size(); seedno++) {
+    std::vector<struct KTest *> oneSeed;
+    oneSeed.push_back(allSeeds.at(seedno));
+    usingSeeds = &oneSeed;
+    errs() << "Using seed no " << seedno << " of size " << kTest_numBytes(allSeeds.at(seedno)) << "\n";
+    assert(seedMap.empty() && "seedmap not empty");
+    assert(states.empty() && "states not empty");
 
-  unsigned NumPtrBytes = Context::get().getPointerWidth() / 8;
-  KFunction *kf = kmodule->functionMap[f];
-  assert(kf);
-  Function::arg_iterator ai = f->arg_begin(), ae = f->arg_end();
-  if (ai!=ae) {
-    arguments.push_back(ConstantExpr::alloc(argc, Expr::Int32));
-    if (++ai!=ae) {
-      Instruction *first = &*(f->begin()->begin());
-      argvMO =
-          memory->allocate((argc + 1 + envc + 1 + 1) * NumPtrBytes,
-                           /*isLocal=*/false, /*isGlobal=*/true,
-                           /*allocSite=*/first, /*alignment=*/8);
+    memory = new MemoryManager(&arrayCache);
 
-      if (!argvMO)
-        klee_error("Could not allocate memory for function arguments");
+    std::vector<ref<Expr> > arguments;
+    // force deterministic initialization of memory objects
+    srand(1);
+    srandom(1);
+    
+    MemoryObject *argvMO = 0;
 
-      arguments.push_back(argvMO->getBaseExpr());
+    // In order to make uclibc happy and be closer to what the system is
+    // doing we lay out the environments at the end of the argv array
+    // (both are terminated by a null). There is also a final terminating
+    // null that uclibc seems to expect, possibly the ELF header?
 
+    int envc;
+    for (envc=0; envp[envc]; ++envc) ;
+
+    unsigned NumPtrBytes = Context::get().getPointerWidth() / 8;
+    KFunction *kf = kmodule->functionMap[f];
+    assert(kf);
+    Function::arg_iterator ai = f->arg_begin(), ae = f->arg_end();
+    if (ai!=ae) {
+      arguments.push_back(ConstantExpr::alloc(argc, Expr::Int32));
       if (++ai!=ae) {
-        uint64_t envp_start = argvMO->address + (argc+1)*NumPtrBytes;
-        arguments.push_back(Expr::createPointer(envp_start));
+        Instruction *first = &*(f->begin()->begin());
+        argvMO =
+            memory->allocate((argc + 1 + envc + 1 + 1) * NumPtrBytes,
+                            /*isLocal=*/false, /*isGlobal=*/true,
+                            /*allocSite=*/first, /*alignment=*/8);
 
-        if (++ai!=ae)
-          klee_error("invalid main function (expect 0-3 arguments)");
-      }
-    }
-  }
-
-  ExecutionState *state = new ExecutionState(kmodule->functionMap[f]);
-  
-  if (pathWriter) 
-    state->pathOS = pathWriter->open();
-  if (symPathWriter) 
-    state->symPathOS = symPathWriter->open();
-
-
-  if (statsTracker)
-    statsTracker->framePushed(*state, 0);
-
-  assert(arguments.size() == f->arg_size() && "wrong number of arguments");
-  for (unsigned i = 0, e = f->arg_size(); i != e; ++i)
-    bindArgument(kf, i, *state, arguments[i]);
-
-  if (argvMO) {
-    ObjectState *argvOS = bindObjectInState(*state, argvMO, false);
-
-    for (int i=0; i<argc+1+envc+1+1; i++) {
-      if (i==argc || i>=argc+1+envc) {
-        // Write NULL pointer
-        argvOS->write(i * NumPtrBytes, Expr::createPointer(0));
-      } else {
-        char *s = i<argc ? argv[i] : envp[i-(argc+1)];
-        int j, len = strlen(s);
-
-        MemoryObject *arg =
-            memory->allocate(len + 1, /*isLocal=*/false, /*isGlobal=*/true,
-                             /*allocSite=*/state->pc->inst, /*alignment=*/8);
-        if (!arg)
+        if (!argvMO)
           klee_error("Could not allocate memory for function arguments");
-        ObjectState *os = bindObjectInState(*state, arg, false);
-        for (j=0; j<len+1; j++)
-          os->write8(j, s[j]);
 
-        // Write pointer to newly allocated and initialised argv/envp c-string
-        argvOS->write(i * NumPtrBytes, arg->getBaseExpr());
+        arguments.push_back(argvMO->getBaseExpr());
+
+        if (++ai!=ae) {
+          uint64_t envp_start = argvMO->address + (argc+1)*NumPtrBytes;
+          arguments.push_back(Expr::createPointer(envp_start));
+
+          if (++ai!=ae)
+            klee_error("invalid main function (expect 0-3 arguments)");
+        }
       }
     }
+
+    ExecutionState *state = new ExecutionState(kmodule->functionMap[f]);
+    // Assign seed to state (used for outputting test cases with correct size)
+    state->seed = oneSeed.front();
+
+    if (pathWriter) 
+      state->pathOS = pathWriter->open();
+    if (symPathWriter) 
+      state->symPathOS = symPathWriter->open();
+
+
+    if (statsTracker)
+      statsTracker->framePushed(*state, 0);
+
+    assert(arguments.size() == f->arg_size() && "wrong number of arguments");
+    for (unsigned i = 0, e = f->arg_size(); i != e; ++i)
+      bindArgument(kf, i, *state, arguments[i]);
+
+    if (argvMO) {
+      ObjectState *argvOS = bindObjectInState(*state, argvMO, false);
+
+      for (int i=0; i<argc+1+envc+1+1; i++) {
+        if (i==argc || i>=argc+1+envc) {
+          // Write NULL pointer
+          argvOS->write(i * NumPtrBytes, Expr::createPointer(0));
+        } else {
+          char *s = i<argc ? argv[i] : envp[i-(argc+1)];
+          int j, len = strlen(s);
+
+          MemoryObject *arg =
+              memory->allocate(len + 1, /*isLocal=*/false, /*isGlobal=*/true,
+                              /*allocSite=*/state->pc->inst, /*alignment=*/8);
+          if (!arg)
+            klee_error("Could not allocate memory for function arguments");
+          ObjectState *os = bindObjectInState(*state, arg, false);
+          for (j=0; j<len+1; j++)
+            os->write8(j, s[j]);
+
+          // Write pointer to newly allocated and initialised argv/envp c-string
+          argvOS->write(i * NumPtrBytes, arg->getBaseExpr());
+        }
+      }
+    }
+    
+    initializeGlobals(*state);
+
+    processTree = new PTree(state);
+    state->ptreeNode = processTree->root;
+    if (seedno==0) bindModuleConstants();
+    run(*state);
+    delete processTree;
+    processTree = 0;
+
+    // hack to clear memory objects
+    delete memory;
+    //memory = new MemoryManager(NULL);
+
+    globalObjects.clear();
+    globalAddresses.clear();
+
+    if (statsTracker)
+      statsTracker->done();
+
   }
-  
-  initializeGlobals(*state);
-
-  processTree = new PTree(state);
-  state->ptreeNode = processTree->root;
-  run(*state);
-  delete processTree;
-  processTree = 0;
-
-  // hack to clear memory objects
-  delete memory;
-  memory = new MemoryManager(NULL);
-
-  globalObjects.clear();
-  globalAddresses.clear();
-
-  if (statsTracker)
-    statsTracker->done();
+  serializeCovEdges();
 }
 
 unsigned Executor::getPathStreamID(const ExecutionState &state) {
@@ -3929,32 +4197,34 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
 
   ExecutionState tmp(state);
 
-  // Go through each byte in every test case and attempt to restrict
-  // it to the constraints contained in cexPreferences.  (Note:
-  // usually this means trying to make it an ASCII character (0-127)
-  // and therefore human readable. It is also possible to customize
-  // the preferred constraints.  See test/Features/PreferCex.c for
-  // an example) While this process can be very expensive, it can
-  // also make understanding individual test cases much easier.
-  for (unsigned i = 0; i != state.symbolics.size(); ++i) {
-    const MemoryObject *mo = state.symbolics[i].first;
-    std::vector< ref<Expr> >::const_iterator pi = 
-      mo->cexPreferences.begin(), pie = mo->cexPreferences.end();
-    for (; pi != pie; ++pi) {
-      bool mustBeTrue;
-      // Attempt to bound byte to constraints held in cexPreferences
-      bool success = solver->mustBeTrue(tmp, Expr::createIsZero(*pi), 
-					mustBeTrue);
-      // If it isn't possible to constrain this particular byte in the desired
-      // way (normally this would mean that the byte can't be constrained to
-      // be between 0 and 127 without making the entire constraint list UNSAT)
-      // then just continue on to the next byte.
-      if (!success) break;
-      // If the particular constraint operated on in this iteration through
-      // the loop isn't implied then add it to the list of constraints.
-      if (!mustBeTrue) tmp.addConstraint(*pi);
+  if (CopyUnconstrainedBytesFromSeed) {
+    // Go through each byte in every test case and attempt to restrict
+    // it to the constraints contained in cexPreferences.  (Note:
+    // usually this means trying to make it an ASCII character (0-127)
+    // and therefore human readable. It is also possible to customize
+    // the preferred constraints.  See test/Features/PreferCex.c for
+    // an example) While this process can be very expensive, it can
+    // also make understanding individual test cases much easier.
+    for (unsigned i = 0; i != state.symbolics.size(); ++i) {
+      const MemoryObject *mo = state.symbolics[i].first;
+      std::vector< ref<Expr> >::const_iterator pi = 
+        mo->cexPreferences.begin(), pie = mo->cexPreferences.end();
+      for (; pi != pie; ++pi) {
+        bool mustBeTrue;
+        // Attempt to bound byte to constraints held in cexPreferences
+        bool success = solver->mustBeTrue(tmp, Expr::createIsZero(*pi), 
+            mustBeTrue);
+        // If it isn't possible to constrain this particular byte in the desired
+        // way (normally this would mean that the byte can't be constrained to
+        // be between 0 and 127 without making the entire constraint list UNSAT)
+        // then just continue on to the next byte.
+        if (!success) break;
+        // If the particular constraint operated on in this iteration through
+        // the loop isn't implied then add it to the list of constraints.
+        if (!mustBeTrue) tmp.addConstraint(*pi);
+      }
+      if (pi!=pie) break;
     }
-    if (pi!=pie) break;
   }
 
   std::vector< std::vector<unsigned char> > values;

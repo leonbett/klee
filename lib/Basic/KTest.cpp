@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "klee/Internal/ADT/KTest.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -210,6 +211,8 @@ int kTest_toFile(KTest *bo, const char *path) {
       goto error;
   }
 
+  llvm::errs() << "Wrote " << ftell(f) << " bytes to " << path << "\n";
+
   fclose(f);
 
   return 1;
@@ -224,6 +227,18 @@ unsigned kTest_numBytes(KTest *bo) {
   for (i=0; i<bo->numObjects; i++)
     res += bo->objects[i].numBytes;
   return res;
+}
+
+unsigned kTest_sizeFirstElem(KTest *bo) {
+  if (bo->numObjects > 0)
+    return bo->objects[0].numBytes;
+  return 0;
+}
+
+unsigned char* kTest_bytesFirstElem(KTest *bo) {
+  if (bo->numObjects > 0)
+    return bo->objects[0].bytes;
+  return 0;
 }
 
 void kTest_free(KTest *bo) {

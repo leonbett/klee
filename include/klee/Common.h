@@ -15,6 +15,7 @@
 #define KLEE_COMMON_H
 #include "klee/Solver.h"
 #include <string>
+#include "llvm/IR/BasicBlock.h"
 
 namespace klee {
     const char ALL_QUERIES_SMT2_FILE_NAME[]="all-queries.smt2";
@@ -29,7 +30,7 @@ namespace klee {
                                  std::string baseSolverQueryKQueryLogPath);
 }
 
-
+uint64_t getBBID(llvm::BasicBlock& bb); // Executor.cpp
 
 #endif /* KLEE_COMMON_H */
 

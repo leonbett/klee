@@ -131,6 +131,12 @@ namespace {
   cl::OptionCategory StartCat("Startup options",
                               "These options affect how execution is started.");
 
+ cl::opt<std::string>
+  RawSyncDir("sync-dir",
+            cl::desc("Directory where KLEE will output generated raw testcases to interface with a fuzzer."),
+            cl::init(""),
+            cl::cat(StartCat));
+
   cl::opt<std::string>
   EntryPoint("entry-point",
              cl::desc("Function in which to start execution (default=main)"),
@@ -329,7 +335,7 @@ public:
 
   void setInterpreter(Interpreter *i);
 
-  void processTestCase(const ExecutionState  &state,
+  bool processTestCase(const ExecutionState  &state,
                        const char *errorMessage,
                        const char *errorSuffix);
 
@@ -483,12 +489,13 @@ KleeHandler::openTestFile(const std::string &suffix, unsigned id) {
 
 
 /* Outputs all files (.ktest, .kquery, .cov etc.) describing a test case */
-void KleeHandler::processTestCase(const ExecutionState &state,
+bool KleeHandler::processTestCase(const ExecutionState &state,
                                   const char *errorMessage,
                                   const char *errorSuffix) {
+  bool success = false;
   if (!WriteNone) {
     std::vector< std::pair<std::string, std::vector<unsigned char> > > out;
-    bool success = m_interpreter->getSymbolicSolution(state, out);
+    success = m_interpreter->getSymbolicSolution(state, out);
 
     if (!success)
       klee_warning("unable to get symbolic solution, losing test case");
@@ -509,16 +516,37 @@ void KleeHandler::processTestCase(const ExecutionState &state,
       for (unsigned i=0; i<b.numObjects; i++) {
         KTestObject *o = &b.objects[i];
         o->name = const_cast<char*>(out[i].first.c_str());
-        o->numBytes = out[i].second.size();
-        o->bytes = new unsigned char[o->numBytes];
-        assert(o->bytes);
-        std::copy(out[i].second.begin(), out[i].second.end(), o->bytes);
+        if (i==0) {
+          // Generated test cases should have the same size as the seed, but the symbolic array has the size of the biggest seed in fork-server mode. So we set the test case size to the seed size, to avoid having test cases filled with padding at the end.
+          o->numBytes = kTest_sizeFirstElem(state.seed);
+          o->bytes = new unsigned char[o->numBytes];
+          assert(o->bytes);
+          assert(o->numBytes <= out[i].second.size() && "Seed size should always be <= symbolic array size");
+          std::copy(out[i].second.begin(), out[i].second.begin()+o->numBytes, o->bytes);
+        }
+        else {
+          o->numBytes = out[i].second.size();
+          o->bytes = new unsigned char[o->numBytes];
+          assert(o->bytes);
+          std::copy(out[i].second.begin(), out[i].second.end(), o->bytes);
+        }
       }
 
       if (!kTest_toFile(&b, getOutputFilename(getTestFilename("ktest", id)).c_str())) {
         klee_warning("unable to write output test case, losing it");
       } else {
         ++m_numGeneratedTests;
+
+        // Output test cases in raw format    
+        if (b.numObjects > 0 && RawSyncDir != "") {
+					SmallString<128> path(RawSyncDir);
+					sys::path::append(path, getTestFilename("raw", id));
+					// Assumption: path exists; must be created by coordinator.
+					FILE *fRaw = fopen(path.c_str(), "wb");
+					KTestObject *o = &b.objects[0];
+					fwrite(o->bytes, o->numBytes, 1, fRaw);
+					fclose(fRaw);
+        }
       }
 
       for (unsigned i=0; i<b.numObjects; i++)
@@ -610,6 +638,8 @@ void KleeHandler::processTestCase(const ExecutionState &state,
     m_interpreter->prepareForEarlyExit();
     klee_error("EXITING ON ERROR:\n%s\n", errorMessage);
   }
+
+  return success;
 }
 
   // load a .path file

@@ -305,6 +305,8 @@ void KModule::optimiseAndPrepare(
   }
   pm3.add(new IntrinsicCleanerPass(*targetData));
   pm3.add(new PhiCleanerPass());
+  pm3.add(new AflIdAssignPass());
+
   pm3.run(*module);
 }
 
